@@ -33,6 +33,7 @@ class VideoDownloader:
             'facebook.com': 'facebook.txt',
             'twitter.com': 'twitter.txt',
             'x.com': 'twitter.txt',
+            'tiktok.com': 'tiktok.txt',
         }
 
         for domain, cookie_file in platform_map.items():

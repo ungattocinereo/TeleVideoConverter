@@ -53,6 +53,7 @@ If you prefer manual export, cookies must be in Netscape format:
    - Instagram → `instagram.txt`
    - Facebook → `facebook.txt`
    - Twitter/X → `twitter.txt`
+   - TikTok → `tiktok.txt`
 
 3. **Restart the downloader service**:
    ```bash
@@ -76,6 +77,7 @@ Currently configured platforms:
 - **Instagram** (`instagram.txt`) - Private profiles, stories, age-restricted
 - **Facebook** (`facebook.txt`) - Private videos, restricted content
 - **Twitter/X** (`twitter.txt`) - Protected accounts, private videos
+- **TikTok** (`tiktok.txt`) - Private/restricted videos, age-gated content
 
 You can add more platforms by creating cookie files with the appropriate names.
 
@@ -148,6 +150,7 @@ Cookies have limited lifespans and need to be refreshed periodically:
 | Instagram | 30-90 days | Authentication errors, login required |
 | Facebook | 30-60 days | Can't access private content |
 | Twitter | 30 days | Protected account access fails |
+| TikTok | 30-60 days | Can't access private/restricted videos |
 
 **What to do when cookies expire:**
 1. Export fresh cookies from your browser (follow setup instructions above)
