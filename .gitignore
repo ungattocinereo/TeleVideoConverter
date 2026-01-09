@@ -1,0 +1,48 @@
+# Environment
+.env
+
+# Storage
+storage/videos/*
+storage/thumbnails/*
+!storage/videos/.gitkeep
+!storage/thumbnails/.gitkeep
+
+# Database
+db/*.db
+db/*.db-*
+
+# Cookies (sensitive data)
+cookies/*.txt
+!cookies/.gitkeep
+!cookies/README.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+*.egg-info/
+
+# Node
+node_modules/
+.pnpm-store/
+dist/
+build/
+.next/
+
+# Logs
+*.log
+logs/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

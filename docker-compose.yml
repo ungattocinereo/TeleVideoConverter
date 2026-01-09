@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - televideo-network
+
+  telegram-bot:
+    build: ./telegram-bot
+    env_file: .env
+    depends_on:
+      - redis
+    volumes:
+      - ./storage:/storage
+      - ./db:/db
+    restart: unless-stopped
+    networks:
+      - televideo-network
+
+  downloader:
+    build: ./downloader
+    env_file: .env
+    depends_on:
+      - redis
+    volumes:
+      - ./storage:/storage
+      - ./db:/db
+      - ./cookies:/cookies
+    restart: unless-stopped
+    networks:
+      - televideo-network
+
+  web-api:
+    build: ./web-api
+    env_file: .env
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./storage:/storage
+      - ./db:/db
+    restart: unless-stopped
+    networks:
+      - televideo-network
+
+  web-frontend:
+    build: ./web-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://localhost:3001
+      - VITE_WS_URL=ws://localhost:3001
+    depends_on:
+      - web-api
+    restart: unless-stopped
+    networks:
+      - televideo-network
+
+  cleanup-cron:
+    build: ./cleanup
+    env_file: .env
+    volumes:
+      - ./storage:/storage
+      - ./db:/db
+    restart: unless-stopped
+    networks:
+      - televideo-network
+
+volumes:
+  redis_data:
+
+networks:
+  televideo-network:
+    driver: bridge
