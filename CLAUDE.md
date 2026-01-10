@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Anithing Download is a self-hosted Telegram bot system for downloading videos from various platforms (YouTube, Vimeo, etc.) with a web interface for file management. The system uses Docker Compose to orchestrate 6 microservices.
+TeleVideoConverter is a self-hosted Telegram bot system for downloading videos from various platforms (YouTube, Instagram, TikTok, Vimeo, etc.) with a web interface for file management. The system uses Docker Compose to orchestrate 6 microservices with a focus on universal video compatibility through H.264 Baseline profile re-encoding.
 
 ## Common Commands
 
@@ -52,14 +52,22 @@ cd web-frontend && npm install && npm run dev
 
 ### Service Communication Flow
 1. **User → Telegram Bot**: User sends URL to bot
-2. **Telegram Bot → Redis**: Bot pushes download task to queue
-3. **Redis → Downloader**: Downloader picks up task from queue
-4. **Downloader → yt-dlp**: Downloads video using yt-dlp
-5. **Downloader → SQLite**: Saves metadata to database
-6. **Downloader → Telegram Bot API**: Sends file back to user
-7. **Web API ← SQLite**: Reads video data for web interface
-8. **Web Frontend ← Web API**: Displays videos via REST API
-9. **Cleanup Service ← SQLite**: Periodically checks for expired videos
+2. **Telegram Bot → Redis**: Bot pushes download task to queue (JSON serialized)
+3. **Redis → Downloader**: Downloader picks up task with `brpop` (blocking)
+4. **Downloader → yt-dlp**: Downloads video using yt-dlp with cookies
+5. **Downloader → ffmpeg**: Force re-encodes all videos (H.264 Baseline)
+6. **Downloader → SQLite**: Saves metadata to shared database
+7. **Downloader → Telegram Bot API**: Sends file back to user via HTTP
+8. **Web API ← SQLite**: Reads video data from shared database
+9. **Web API → Web Frontend**: Pushes updates via WebSocket
+10. **Web Frontend ← Web API**: Displays videos via REST API
+11. **Cleanup Service ← SQLite**: Periodically checks for expired videos
+
+**Critical Notes:**
+- SQLite database is **shared** across all services via bind mount (`./db:/db`)
+- Each service has its own `database.py` but all connect to same file
+- Python services use `aiosqlite` for async database access
+- No database locking issues as SQLite handles concurrent reads well
 
 ### Key Technologies
 - **Backend**: Python 3.11 with asyncio
@@ -76,13 +84,15 @@ cd web-frontend && npm install && npm run dev
 
 ### Telegram Bot (`telegram-bot/`)
 - `bot.py` - Main bot logic with command handlers
-- `database.py` - SQLite database operations
+- `database.py` - SQLite database operations (aiosqlite)
 - `utils.py` - Helper functions (formatting, validation)
 
 **Key Patterns:**
-- All handlers check user permissions via `check_user_permission()`
-- Rate limiting tracked in-memory with `user_downloads` dict
+- All handlers check user permissions via `check_user_permission()` against `ALLOWED_USER_IDS` set
+- Rate limiting tracked in-memory with `user_downloads` dict (10 downloads/hour)
 - Download tasks serialized as JSON and pushed to Redis queue
+- User settings (like post description toggle) stored in `user_settings` table
+- Commands: `/start`, `/list`, `/search`, `/stats`, `/description`
 
 ### Downloader (`downloader/`)
 - `worker.py` - Main worker loop consuming Redis queue
@@ -91,10 +101,17 @@ cd web-frontend && npm install && npm run dev
 
 **Key Patterns:**
 - Runs infinite loop with `brpop` on Redis queue (blocking)
-- Quality mapping: `720p` → height<=720, `4k` → height<=2160, `audio` → audio-only MP3
-- Always converts to MP4 (H.264) for Telegram compatibility
+- Format preference: `bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best`
+- **Critical: All videos force re-encoded using `_reencode_video()` with:**
+  - H.264 Baseline profile (level 3.0) for iOS/macOS compatibility
+  - Keyframes every 50 frames (GOP 50) for proper seeking
+  - AAC audio at 128k, 44.1kHz
+  - `faststart` movflag for streaming
+  - Even dimensions via `scale=trunc(iw/2)*2:trunc(ih/2)*2`
+- Cookie-based auth for private content (Instagram, TikTok) via `_get_cookie_file()`
 - Generates 320x180 JPEG thumbnails
-- Sends two messages: (1) statistics, (2) actual file
+- Post description extraction from yt-dlp metadata
+- Sends up to three messages: (1) stats, (2) file, (3) description (if enabled)
 
 ### Web API (`web-api/`)
 - `api.py` - FastAPI application with REST endpoints and WebSocket
@@ -170,24 +187,49 @@ CREATE TABLE download_stats (
 )
 ```
 
+### User Settings Table
+```sql
+CREATE TABLE user_settings (
+    telegram_user_id INTEGER PRIMARY KEY,
+    send_description INTEGER DEFAULT 1,  -- 1=enabled, 0=disabled
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+```
+
+**Important Indexes:**
+- `idx_delete_timestamp` on `videos(delete_timestamp)` - for cleanup queries
+- `idx_telegram_user_id` on `videos(telegram_user_id)` - for user-specific queries
+- `idx_stats_timestamp` on `download_stats(timestamp)` - for stats queries
+
 ## Important Implementation Details
 
 ### File Storage
-- Videos: `/storage/videos/{video_id}.{ext}`
-- Thumbnails: `/storage/thumbnails/{video_id}.jpg`
-- Database: `/db/anithing.db`
+- Videos: `/storage/videos/{video_id}.{ext}` (always `.mp4` after re-encoding)
+- Thumbnails: `/storage/thumbnails/{video_id}.jpg` (320x180 JPEG)
+- Database: `/db/televideo.db` (SQLite, shared across services)
+- Cookies: `/cookies/{platform}.txt` (Netscape format for yt-dlp)
 
-### Quality Mappings
-- `720p` → `bestvideo[height<=720]+bestaudio/best[height<=720]`
-- `1080p` → `bestvideo[height<=1080]+bestaudio/best[height<=1080]`
-- `4k` → `bestvideo[height<=2160]+bestaudio/best[height<=2160]`
-- `audio` → `bestaudio/best` → converted to MP3 192kbps
+### Cookie Authentication
+Platform-specific cookie files in `/cookies/` directory:
+- `instagram.txt` - Instagram authentication
+- `tiktok.txt` - TikTok authentication
+- `facebook.txt`, `twitter.txt` - Other platforms
+- Auto-detected via `_get_cookie_file()` based on URL domain
+
+### Video Re-encoding (Critical)
+**All downloaded videos are force re-encoded** to fix compatibility issues:
+- **Problem**: Instagram/TikTok use H.264 High Profile → frozen videos on iOS/macOS
+- **Solution**: Re-encode to H.264 Baseline Profile (level 3.0)
+- **Implementation**: `ytdlp_wrapper.py::_reencode_video()` using ffmpeg
+- **Settings**: CRF 23, GOP 50, AAC 128k, faststart flag, even dimensions
+- **Trade-off**: Adds 5-10 seconds processing time but guarantees universal playback
 
 ### Security
-- Only one Telegram user ID allowed (hardcoded in .env)
-- Rate limit: 10 downloads per hour per user
-- No authentication on web interface (assumes private network)
-- Storage limit enforced: 5GB maximum
+- Multiple Telegram user IDs allowed (comma-separated in `TELEGRAM_USER_IDS`)
+- Rate limit: 10 downloads per hour per user (in-memory tracking)
+- No authentication on web interface (assumes private network deployment)
+- Storage limit enforced: 5GB maximum (configurable)
 
 ### Telegram File Size Limit
 - Max 2GB per file
@@ -233,26 +275,76 @@ async def new_endpoint():
 4. Apply Tailwind CSS classes for styling
 
 ### Debugging Download Issues
-1. Check bot logs for URL validation
-2. Check downloader logs for yt-dlp errors
-3. Test yt-dlp directly: `yt-dlp --list-formats <URL>`
-4. Verify ffmpeg is installed in downloader container
+1. Check bot logs for URL validation: `docker-compose logs -f telegram-bot`
+2. Check downloader logs for yt-dlp errors: `docker-compose logs -f downloader`
+3. Test yt-dlp directly in container:
+   ```bash
+   docker-compose exec downloader yt-dlp --list-formats <URL>
+   docker-compose exec downloader yt-dlp --cookies /cookies/instagram.txt <URL>
+   ```
+4. Verify ffmpeg is installed: `docker-compose exec downloader ffmpeg -version`
+5. Check Redis queue:
+   ```bash
+   docker-compose exec redis redis-cli LLEN download_queue
+   docker-compose exec redis redis-cli LRANGE download_queue 0 -1
+   ```
+
+### Debugging Re-encoding Issues
+- Re-encoding failures fall back to original file (no crash)
+- Check ffmpeg stderr in downloader logs
+- Common issues: unsupported codecs, corrupted downloads
+- Test ffmpeg manually:
+  ```bash
+  docker-compose exec downloader ffmpeg -i /storage/videos/test.mp4 -c:v libx264 -profile:v baseline test_out.mp4
+  ```
+
+### Debugging Cookie Authentication
+1. Cookie files must be in Netscape format
+2. Export from browser using extensions (e.g., "Get cookies.txt")
+3. Place in `./cookies/{platform}.txt`
+4. Verify file permissions: `chmod 644 cookies/*.txt`
+5. Test with yt-dlp: `yt-dlp --cookies cookies/instagram.txt <URL>`
 
 ### Modifying Storage Limits
 1. Update `MAX_STORAGE_GB` in `.env`
 2. Update `RETENTION_DAYS` in `.env`
 3. Restart services: `docker-compose restart`
 
-## Environment Variables Location
-All configuration in `.env` file at project root. Already configured with Telegram credentials.
+## Environment Variables
+
+All configuration in `.env` file at project root:
+
+**Required:**
+- `TELEGRAM_BOT_TOKEN` - Bot token from @BotFather
+- `TELEGRAM_USER_IDS` - Comma-separated user IDs (e.g., "100269722,40882420")
+
+**Paths:**
+- `STORAGE_PATH=/storage`
+- `DATABASE_PATH=/db/televideo.db`
+- `COOKIES_PATH=/cookies`
+
+**Storage:**
+- `MAX_STORAGE_GB=5` - Storage limit triggers cleanup
+- `RETENTION_DAYS=3` - Auto-delete after 3 days (259200 seconds)
+
+**Features:**
+- `SEND_POST_DESCRIPTION=true` - Default for new users (toggleable per-user)
+
+**Network:**
+- `REDIS_HOST=redis`, `REDIS_PORT=6379`
+- `API_PORT=3001`, `API_HOST=0.0.0.0`
+
+**Frontend:**
+- `VITE_API_URL=http://localhost:3001`
+- `VITE_WS_URL=ws://localhost:3001`
 
 ## Port Mappings
-- 3000: Web Frontend (Nginx)
-- 3001: Web API (FastAPI)
-- 6379: Redis (internal only)
+- 3000: Web Frontend (Nginx serving Vite build)
+- 3001: Web API (FastAPI with uvicorn)
+- 6379: Redis (internal network only, not exposed)
 
-## File Permissions
-Storage and database directories need write permissions:
-```bash
-chmod -R 777 storage/ db/
-```
+## Docker Volumes
+- `redis_data` - Named volume for Redis persistence
+- `./storage:/storage` - Bind mount for videos/thumbnails
+- `./db:/db` - Bind mount for SQLite database
+- `./cookies:/cookies` - Bind mount for authentication cookies (downloader only)
