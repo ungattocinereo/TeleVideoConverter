@@ -24,6 +24,7 @@ DATABASE_PATH = os.getenv('DATABASE_PATH', '/db/televideo.db')
 STORAGE_PATH = os.getenv('STORAGE_PATH', '/storage')
 COOKIES_PATH = os.getenv('COOKIES_PATH', '/cookies')
 RETENTION_DAYS = int(os.getenv('RETENTION_DAYS', 3))
+SEND_POST_DESCRIPTION = os.getenv('SEND_POST_DESCRIPTION', 'true').lower() == 'true'
 
 class DownloadWorker:
     def __init__(self):
@@ -106,6 +107,30 @@ Title: {stats['title']}"""
                 text=f"❌ Error sending file: {str(e)}"
             )
 
+    async def send_description(self, chat_id: int, description: str, title: str):
+        """Send post description to user as a separate message"""
+        try:
+            if not description or not description.strip():
+                logger.debug("No description available, skipping")
+                return
+
+            # Truncate description if too long (Telegram message limit is 4096 characters)
+            max_length = 4000
+            if len(description) > max_length:
+                description = description[:max_length] + "..."
+
+            message = f"📝 Description:\n\n{description}"
+
+            await self.bot.send_message(
+                chat_id=chat_id,
+                text=message
+            )
+            logger.info(f"Description sent for: {title}")
+
+        except Exception as e:
+            logger.error(f"Error sending description: {e}")
+            # Don't send error message to user - description is optional
+
     async def process_download(self, task: dict):
         """Process a download task"""
         url = task['url']
@@ -165,6 +190,18 @@ Title: {stats['title']}"""
                     result.get('width'),
                     result.get('height')
                 )
+
+                # Send description if enabled (check user setting)
+                user_setting = await self.db.get_user_setting(user_id, 'send_description')
+                # Default to global env var if user hasn't set preference
+                send_desc = bool(user_setting) if user_setting is not None else SEND_POST_DESCRIPTION
+
+                if send_desc:
+                    await self.send_description(
+                        chat_id,
+                        result.get('description', ''),
+                        result['title']
+                    )
 
             logger.info(f"Download complete: {result['video_id']} ({self._format_size(result['file_size'])}, {self._format_duration(processing_time)}) [Source: {'Web' if chat_id == 0 else 'Telegram'}]")
 

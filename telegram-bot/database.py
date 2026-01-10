@@ -59,6 +59,15 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_stats_timestamp ON download_stats(timestamp)
         ''')
 
+        await self.db.execute('''
+            CREATE TABLE IF NOT EXISTS user_settings (
+                telegram_user_id INTEGER PRIMARY KEY,
+                send_description INTEGER DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         await self.db.commit()
 
     async def add_video(self, video_data: Dict) -> int:
@@ -221,6 +230,26 @@ class Database:
         columns = [description[0] for description in cursor.description]
 
         return [dict(zip(columns, row)) for row in rows]
+
+    async def get_user_setting(self, user_id: int, setting_name: str) -> Optional[int]:
+        """Get a user setting"""
+        cursor = await self.db.execute(f'''
+            SELECT {setting_name} FROM user_settings WHERE telegram_user_id = ?
+        ''', (user_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+    async def set_user_setting(self, user_id: int, setting_name: str, value: int):
+        """Set a user setting (creates user if doesn't exist)"""
+        # Try to insert, if user exists, update
+        await self.db.execute(f'''
+            INSERT INTO user_settings (telegram_user_id, {setting_name}, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(telegram_user_id) DO UPDATE SET
+                {setting_name} = excluded.{setting_name},
+                updated_at = CURRENT_TIMESTAMP
+        ''', (user_id, value))
+        await self.db.commit()
 
     async def close(self):
         """Close database connection"""

@@ -59,6 +59,15 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_stats_timestamp ON download_stats(timestamp)
         ''')
 
+        await self.db.execute('''
+            CREATE TABLE IF NOT EXISTS user_settings (
+                telegram_user_id INTEGER PRIMARY KEY,
+                send_description INTEGER DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         await self.db.commit()
 
     async def add_video(self, video_data: Dict) -> int:
@@ -154,6 +163,14 @@ class Database:
             VALUES (?, ?, ?, ?)
         ''', (user_id, video_id, action, int(time.time())))
         await self.db.commit()
+
+    async def get_user_setting(self, user_id: int, setting_name: str) -> Optional[int]:
+        """Get a user setting"""
+        cursor = await self.db.execute(f'''
+            SELECT {setting_name} FROM user_settings WHERE telegram_user_id = ?
+        ''', (user_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
 
     async def close(self):
         """Close database connection"""

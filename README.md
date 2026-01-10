@@ -5,10 +5,13 @@ A self-hosted Telegram bot for downloading videos with a web interface for manag
 ## Features
 
 - **Telegram Bot Integration**
-  - Download videos from multiple platforms (YouTube, Vimeo, and more via yt-dlp)
-  - Quality selection (720p, 1080p, 4K, Audio Only)
+  - Download videos from multiple platforms (YouTube, Instagram, TikTok, Vimeo, and more via yt-dlp)
+  - Automatic best quality selection with universal device compatibility
+  - Post description extraction and optional display (toggle with /description)
+  - Per-user settings stored in database
   - Automatic file management with 3-day retention
   - User authentication via whitelist
+  - Cookie-based authentication for private content (Instagram, TikTok, etc.)
 
 - **Web Interface**
   - Modern dark-themed UI built with React and shadcn/ui
@@ -23,6 +26,13 @@ A self-hosted Telegram bot for downloading videos with a web interface for manag
   - 5GB storage limit with automatic management
   - SQLite database for metadata
   - Efficient file organization
+
+- **Video Encoding & Compatibility**
+  - Force re-encoding with H.264 Baseline profile for universal compatibility
+  - Optimized for iOS, macOS, Android, and Desktop Telegram clients
+  - Proper keyframe intervals and streaming support
+  - Fixes Instagram/TikTok video playback issues on Apple devices
+  - Automatic codec conversion ensuring videos play correctly everywhere
 
 ## Prerequisites
 
@@ -104,8 +114,12 @@ The system consists of 6 Docker services:
 - `/list` - List all saved videos with details
 - `/search <keyword>` - Search videos by title
 - `/stats` - Show usage statistics
+- `/description` - Toggle post description display (on/off)
 
-To download a video, simply send a URL to the bot!
+To download a video, simply send a URL to the bot! The bot will:
+1. Send technical details (file size, quality, processing time)
+2. Send the video file with thumbnail
+3. Send the post description (if enabled with `/description`)
 
 ## Development
 
@@ -153,13 +167,15 @@ python cleanup_cron.py
 All configuration is done via `.env`:
 
 - `TELEGRAM_BOT_TOKEN` - Your Telegram bot token
-- `TELEGRAM_USER_ID` - Your Telegram user ID
+- `TELEGRAM_USER_IDS` - Comma-separated list of allowed Telegram user IDs
 - `REDIS_HOST` - Redis hostname (default: redis)
 - `REDIS_PORT` - Redis port (default: 6379)
 - `STORAGE_PATH` - Path for video storage (default: /storage)
 - `MAX_STORAGE_GB` - Maximum storage in GB (default: 5)
 - `RETENTION_DAYS` - Days to keep videos (default: 3)
-- `DATABASE_PATH` - SQLite database path (default: /db/anithing.db)
+- `SEND_POST_DESCRIPTION` - Send post descriptions by default (default: true)
+- `COOKIES_PATH` - Path for authentication cookies (default: /cookies)
+- `DATABASE_PATH` - SQLite database path (default: /db/televideo.db)
 - `API_PORT` - Web API port (default: 3001)
 - `LOG_LEVEL` - Logging level (default: INFO)
 
@@ -190,6 +206,12 @@ Tracks user actions:
 - Delete events
 - Timestamps for analytics
 
+### User Settings Table
+Stores per-user preferences:
+- Post description display preference
+- Other customizable settings
+- Created and updated timestamps
+
 ## API Endpoints
 
 - `GET /api/videos` - List all videos
@@ -200,6 +222,30 @@ Tracks user actions:
 - `GET /api/search?q=keyword` - Search videos
 - `GET /api/thumbnails/:filename` - Get thumbnail image
 - `WebSocket /ws` - Real-time updates
+
+## Video Encoding Technology
+
+This project uses advanced video encoding to ensure **bulletproof compatibility** across all devices:
+
+### Why Re-encoding?
+Instagram, TikTok, and other platforms often use H.264 High Profile codecs that don't work properly on iOS/macOS Telegram clients. Videos appear "frozen" with only audio playing.
+
+### Our Solution
+Every downloaded video is **automatically re-encoded** with:
+- **H.264 Baseline Profile** - Maximum compatibility across all devices
+- **Level 3.0** - Universal device support
+- **Proper keyframe intervals (GOP 50)** - Smooth playback and seeking
+- **AAC audio at 44.1kHz** - Standard compatibility
+- **faststart flag** - Enables streaming before full download
+- **Even dimensions** - Prevents encoding artifacts
+
+### Result
+✅ Videos from Instagram work perfectly on iPhone/iPad/Mac
+✅ No more "frozen first frame" issues
+✅ Proper playback controls and seeking
+✅ Universal compatibility across all Telegram clients
+
+The re-encoding process adds 5-10 seconds to download time but **guarantees** your videos will play correctly everywhere.
 
 ## Troubleshooting
 

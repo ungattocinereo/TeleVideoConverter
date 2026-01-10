@@ -81,6 +81,7 @@ Send me a video URL and I'll download it for you.
 /list - Show all saved videos
 /search <keyword> - Search videos
 /stats - Show usage statistics
+/description - Toggle post description
 
 Supported platforms: YouTube, Vimeo, and many more!
 """
@@ -173,6 +174,28 @@ Supported platforms: YouTube, Vimeo, and many more!
         await update.message.reply_text(message)
         logger.info(f"User {user_id} checked stats")
 
+    async def description_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /description command - toggle post description"""
+        user_id = update.effective_user.id
+
+        if not self.check_user_permission(user_id):
+            return
+
+        # Get current setting (default is 1 = enabled)
+        current_setting = await self.db.get_user_setting(user_id, 'send_description')
+        if current_setting is None:
+            current_setting = 1  # Default to enabled
+
+        # Toggle the setting
+        new_setting = 0 if current_setting == 1 else 1
+        await self.db.set_user_setting(user_id, 'send_description', new_setting)
+
+        status = "enabled ✅" if new_setting == 1 else "disabled ❌"
+        message = f"📝 Post description is now {status}"
+
+        await update.message.reply_text(message)
+        logger.info(f"User {user_id} toggled description: {status}")
+
     async def handle_url(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle URL messages"""
         user_id = update.effective_user.id
@@ -237,6 +260,7 @@ def main():
     application.add_handler(CommandHandler("list", bot.list_command))
     application.add_handler(CommandHandler("search", bot.search_command))
     application.add_handler(CommandHandler("stats", bot.stats_command))
+    application.add_handler(CommandHandler("description", bot.description_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
 
     # Initialize bot asynchronously

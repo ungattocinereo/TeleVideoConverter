@@ -1,5 +1,6 @@
 import os
 import yt_dlp
+import subprocess
 from typing import Dict, Optional
 from PIL import Image
 
@@ -19,8 +20,68 @@ class VideoDownloader:
         if quality == 'audio':
             return 'bestaudio/best'
         else:
-            # Use best available quality (avoids format compatibility issues)
-            return 'bestvideo+bestaudio/best'
+            # Prefer MP4 container with compatible codecs for better Telegram compatibility
+            # Fallback to best available if MP4 not available
+            return 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best'
+
+    def _reencode_video(self, input_path: str, video_id: str) -> str:
+        """Force re-encode video with Telegram-compatible settings using ffmpeg"""
+        output_path = os.path.join(self.videos_path, f"{video_id}_reencoded.mp4")
+
+        # FFmpeg command with Telegram-compatible settings
+        ffmpeg_cmd = [
+            'ffmpeg', '-i', input_path,
+            '-y',  # Overwrite output file
+            # Video settings - H.264 Baseline for maximum iOS/macOS compatibility
+            '-c:v', 'libx264',
+            '-profile:v', 'baseline',
+            '-level', '3.0',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-g', '50',  # Keyframe every 50 frames
+            '-keyint_min', '25',
+            # Audio settings
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-ar', '44100',
+            # Format settings
+            '-pix_fmt', 'yuv420p',
+            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+            # Container settings
+            '-movflags', '+faststart',
+            '-fflags', '+genpts',
+            '-max_muxing_queue_size', '9999',
+            output_path
+        ]
+
+        try:
+            print(f"Re-encoding video for Telegram compatibility: {video_id}")
+            result = subprocess.run(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True
+            )
+
+            # Remove original file and rename re-encoded file
+            if os.path.exists(output_path):
+                os.remove(input_path)
+                os.rename(output_path, input_path)
+                print(f"Re-encoding successful: {video_id}")
+                return input_path
+            else:
+                print(f"Re-encoding failed: output file not found")
+                return input_path
+
+        except subprocess.CalledProcessError as e:
+            print(f"FFmpeg re-encoding error: {e.stderr.decode()}")
+            # Return original file if re-encoding fails
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            return input_path
+        except Exception as e:
+            print(f"Re-encoding exception: {e}")
+            return input_path
 
     def _get_cookie_file(self, url: str) -> Optional[str]:
         """Detect platform and return appropriate cookie file path"""
@@ -60,6 +121,7 @@ class VideoDownloader:
                 'quiet': False,
                 'no_warnings': False,
                 'extract_flat': False,
+                'writeinfojson': False,  # Don't write JSON file, just extract info
             }
 
             if is_audio_only:
@@ -69,11 +131,8 @@ class VideoDownloader:
                     'preferredquality': '192',
                 }]
             else:
+                # Just merge to MP4, we'll force re-encode manually after download
                 ydl_opts['merge_output_format'] = 'mp4'
-                ydl_opts['postprocessors'] = [{
-                    'key': 'FFmpegVideoConvertor',
-                    'preferedformat': 'mp4',
-                }]
 
             # Add cookie support
             cookie_file = self._get_cookie_file(url)
@@ -95,7 +154,12 @@ class VideoDownloader:
                 if not is_audio_only and 'height' in info:
                     original_quality = f"{info['width']}x{info['height']} ({info['height']}p)"
 
-                # Get file size
+                # FORCE re-encode video for Telegram compatibility
+                # This ensures Instagram and other videos work correctly on iOS/macOS
+                if not is_audio_only and os.path.exists(file_path):
+                    file_path = self._reencode_video(file_path, video_id)
+
+                # Get file size (after re-encoding)
                 file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
                 # Process thumbnail
@@ -115,6 +179,15 @@ class VideoDownloader:
                     width = info.get('width')
                     height = info.get('height')
 
+                # Get description (try multiple fields for different platforms)
+                # Instagram uses 'description', YouTube uses 'description', TikTok might use 'description' or 'title'
+                description = (
+                    info.get('description') or
+                    info.get('caption') or
+                    info.get('alt_title') or
+                    ''
+                )
+
                 return {
                     'success': True,
                     'video_id': video_id,
@@ -127,7 +200,8 @@ class VideoDownloader:
                     'source_platform': source_platform,
                     'thumbnail_path': thumbnail_path,
                     'width': width,
-                    'height': height
+                    'height': height,
+                    'description': description
                 }
 
         except Exception as e:
