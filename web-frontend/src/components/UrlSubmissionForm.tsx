@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Link, Download, Loader2 } from 'lucide-react'
+import { Download, Loader2 } from 'lucide-react'
 
 interface UrlSubmissionFormProps {
   onSubmit: (url: string, quality: string) => Promise<void>
@@ -40,48 +40,41 @@ export function UrlSubmissionForm({ onSubmit }: UrlSubmissionFormProps) {
   }
 
   return (
-    <div className="bg-card border rounded-lg p-6 mb-6">
-      <div className="flex items-center gap-2 mb-4">
-        <Link className="h-5 w-5 text-primary" />
-        <h2 className="text-xl font-semibold">Download Video</h2>
-      </div>
-
-      <form onSubmit={handleSubmit} className="space-y-4">
-        <div>
-          <Input
-            type="text"
-            placeholder="Enter video URL (YouTube, Instagram, Vimeo, etc.)"
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            disabled={isSubmitting}
-            className="w-full"
-          />
-          {error && (
-            <p className="text-sm text-destructive mt-2">{error}</p>
-          )}
-          <p className="text-xs text-muted-foreground mt-2">
-            Video will be downloaded in the best available quality
-          </p>
-        </div>
-
-        <Button
-          type="submit"
-          className="w-full"
+    <form onSubmit={handleSubmit} className="flex flex-col sm:flex-row gap-2">
+      <div className="flex-1 min-w-0">
+        <Input
+          type="text"
+          placeholder="Paste video URL (YouTube, Instagram, TikTok...)"
+          value={url}
+          onChange={(e) => {
+            setUrl(e.target.value)
+            if (error) setError('')
+          }}
           disabled={isSubmitting}
-        >
-          {isSubmitting ? (
-            <>
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              Submitting...
-            </>
-          ) : (
-            <>
-              <Download className="mr-2 h-4 w-4" />
-              Download Video
-            </>
-          )}
-        </Button>
-      </form>
-    </div>
+          className={error ? 'border-destructive' : ''}
+        />
+        {error && (
+          <p className="text-xs text-destructive mt-1">{error}</p>
+        )}
+      </div>
+      <Button
+        type="submit"
+        disabled={isSubmitting}
+        className="sm:w-auto w-full flex-shrink-0"
+      >
+        {isSubmitting ? (
+          <>
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            <span className="hidden sm:inline">Downloading...</span>
+            <span className="sm:hidden">...</span>
+          </>
+        ) : (
+          <>
+            <Download className="mr-2 h-4 w-4" />
+            Download
+          </>
+        )}
+      </Button>
+    </form>
   )
 }

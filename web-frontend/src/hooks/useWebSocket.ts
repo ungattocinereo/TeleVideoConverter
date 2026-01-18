@@ -6,7 +6,8 @@ export function useWebSocket(onMessage: (message: WebSocketMessage) => void) {
   const reconnectTimeout = useRef<NodeJS.Timeout | null>(null)
 
   const connect = useCallback(() => {
-    const wsUrl = import.meta.env.VITE_WS_URL || 'ws://localhost:3001'
+    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    const wsUrl = `${protocol}://${window.location.host}`
     ws.current = new WebSocket(`${wsUrl}/ws`)
 
     ws.current.onopen = () => {

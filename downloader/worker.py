@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 import redis.asyncio as redis
 from telegram import Bot
+from telegram.request import HTTPXRequest
 from ytdlp_wrapper import VideoDownloader
 from database import Database
 
@@ -30,7 +31,18 @@ class DownloadWorker:
     def __init__(self):
         self.db = Database(DATABASE_PATH)
         self.redis_client = None
-        self.bot = Bot(token=BOT_TOKEN)
+        # Configure larger timeouts for large file uploads
+        # read_timeout: time to wait for server response
+        # write_timeout: time to wait for upload to complete
+        # connect_timeout: time to wait for connection
+        request = HTTPXRequest(
+            connection_pool_size=8,
+            read_timeout=300.0,      # 5 minutes for reading response
+            write_timeout=300.0,     # 5 minutes for uploading large files
+            connect_timeout=30.0,    # 30 seconds for connection
+            pool_timeout=30.0
+        )
+        self.bot = Bot(token=BOT_TOKEN, request=request)
         self.downloader = VideoDownloader(STORAGE_PATH, COOKIES_PATH)
 
     async def initialize(self):
@@ -61,11 +73,13 @@ Title: {stats['title']}"""
         try:
             file_size = os.path.getsize(file_path)
 
-            # Telegram has a 2GB file size limit
-            if file_size > 2 * 1024 * 1024 * 1024:
+            # Telegram Bot API has a 50MB file size limit for send_video
+            # Files larger than 50MB must be downloaded via web interface
+            if file_size > 50 * 1024 * 1024:
+                size_mb = file_size / (1024 * 1024)
                 await self.bot.send_message(
                     chat_id=chat_id,
-                    text="⚠️ File too large for Telegram (>2GB).\nDownload via web interface: http://localhost:3000"
+                    text=f"⚠️ File too large for Telegram Bot API ({size_mb:.1f} MB > 50 MB).\n\n📥 Download via web interface:\nhttps://televideo.cnr.pw"
                 )
                 return
 
@@ -213,12 +227,33 @@ Title: {stats['title']}"""
                     text=f"❌ Error: {str(e)}"
                 )
 
+    async def ensure_redis_connection(self):
+        """Ensure Redis connection is alive, reconnect if needed"""
+        try:
+            await self.redis_client.ping()
+            return True
+        except Exception as e:
+            logger.warning(f"Redis connection lost, reconnecting: {e}")
+            try:
+                self.redis_client = await redis.from_url(f'redis://{REDIS_HOST}:{REDIS_PORT}')
+                await self.redis_client.ping()
+                logger.info("Redis reconnected successfully")
+                return True
+            except Exception as reconnect_error:
+                logger.error(f"Redis reconnection failed: {reconnect_error}")
+                return False
+
     async def run(self):
         """Main worker loop"""
         logger.info("Download worker started, waiting for tasks...")
 
         while True:
             try:
+                # Ensure Redis connection is alive
+                if not await self.ensure_redis_connection():
+                    await asyncio.sleep(5)
+                    continue
+
                 # Wait for task from Redis queue
                 task_data = await self.redis_client.brpop('download_queue', timeout=5)
 

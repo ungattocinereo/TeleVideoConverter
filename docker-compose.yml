@@ -1,38 +1,43 @@
-version: '3.8'
-
 services:
   redis:
     image: redis:7-alpine
     volumes:
       - redis_data:/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
     networks:
-      - televideo-network
+      - common
 
   telegram-bot:
     build: ./telegram-bot
     env_file: .env
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     volumes:
       - ./storage:/storage
       - ./db:/db
     restart: unless-stopped
     networks:
-      - televideo-network
+      - common
 
   downloader:
     build: ./downloader
     env_file: .env
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     volumes:
       - ./storage:/storage
       - ./db:/db
       - ./cookies:/cookies
     restart: unless-stopped
     networks:
-      - televideo-network
+      - common
 
   web-api:
     build: ./web-api
@@ -44,20 +49,17 @@ services:
       - ./db:/db
     restart: unless-stopped
     networks:
-      - televideo-network
+      - common
 
   web-frontend:
     build: ./web-frontend
     ports:
       - "3000:3000"
-    environment:
-      - VITE_API_URL=http://localhost:3001
-      - VITE_WS_URL=ws://localhost:3001
     depends_on:
       - web-api
     restart: unless-stopped
     networks:
-      - televideo-network
+      - common
 
   cleanup-cron:
     build: ./cleanup
@@ -67,11 +69,11 @@ services:
       - ./db:/db
     restart: unless-stopped
     networks:
-      - televideo-network
+      - common
 
 volumes:
   redis_data:
 
 networks:
-  televideo-network:
-    driver: bridge
+  common:
+    external: true

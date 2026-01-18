@@ -1,5 +1,6 @@
 import aiosqlite
 import time
+import os
 from typing import List, Dict, Optional
 
 class Database:
@@ -10,6 +11,12 @@ class Database:
     async def initialize(self):
         """Initialize database and create tables"""
         self.db = await aiosqlite.connect(self.db_path)
+        # Ensure database file has correct permissions
+        try:
+            os.chmod(self.db_path, 0o666)
+            os.chmod(os.path.dirname(self.db_path), 0o777)
+        except Exception:
+            pass  # Ignore permission errors
         await self._create_tables()
 
     async def _create_tables(self):

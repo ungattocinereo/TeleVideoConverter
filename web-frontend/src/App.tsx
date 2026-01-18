@@ -8,7 +8,7 @@ import { Video, Stats, WebSocketMessage } from './types'
 import { useWebSocket } from './hooks/useWebSocket'
 import { Search } from 'lucide-react'
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
+const API_URL = ''  // Relative to current origin
 
 function App() {
   const [videos, setVideos] = useState<Video[]>([])
@@ -161,23 +161,29 @@ function App() {
     <div className="min-h-screen bg-background">
       <Header stats={stats} />
 
-      <main className="container mx-auto px-4 py-8">
-        {/* URL Submission Form */}
-        <div className="mb-8 max-w-2xl">
-          <UrlSubmissionForm onSubmit={handleUrlSubmit} />
-        </div>
+      <main className="container mx-auto px-4 py-4 md:py-8">
+        {/* Controls section */}
+        <div className="mb-6 md:mb-8 space-y-4">
+          {/* URL Submission and Search in responsive grid */}
+          <div className="grid grid-cols-1 lg:grid-cols-[1fr,300px] gap-4">
+            {/* URL Submission Form */}
+            <div className="bg-card border rounded-lg p-3 md:p-4">
+              <UrlSubmissionForm onSubmit={handleUrlSubmit} />
+            </div>
 
-        {/* Search bar */}
-        <div className="mb-8 max-w-md">
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-            <Input
-              type="text"
-              placeholder="Search videos..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="pl-10"
-            />
+            {/* Search bar */}
+            <div className="bg-card border rounded-lg p-3 md:p-4">
+              <div className="relative h-full flex items-center">
+                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                <Input
+                  type="text"
+                  placeholder="Search videos..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="pl-10"
+                />
+              </div>
+            </div>
           </div>
         </div>
 

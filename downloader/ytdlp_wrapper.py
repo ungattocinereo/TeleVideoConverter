@@ -208,8 +208,22 @@ class VideoDownloader:
             error_msg = str(e)
 
             # Provide helpful error messages for authentication issues
-            if 'login' in error_msg.lower() or 'private' in error_msg.lower() or 'authentication' in error_msg.lower():
-                if 'instagram.com' in url.lower():
+            url_lower = url.lower()
+
+            # Twitter/X requires authentication for all video content
+            if ('twitter.com' in url_lower or 'x.com' in url_lower) and 'no video could be found' in error_msg.lower():
+                cookie_file = os.path.join(self.cookies_path, 'twitter.txt') if self.cookies_path else None
+                if not cookie_file or not os.path.exists(cookie_file):
+                    error_msg = (
+                        f"Twitter/X requires authentication to access videos.\n\n"
+                        f"To fix this:\n"
+                        f"1. Install 'Get cookies.txt LOCALLY' browser extension\n"
+                        f"2. Log into x.com in your browser\n"
+                        f"3. Export cookies and save as 'cookies/twitter.txt'\n"
+                        f"4. Run: docker-compose restart downloader"
+                    )
+            elif 'login' in error_msg.lower() or 'private' in error_msg.lower() or 'authentication' in error_msg.lower():
+                if 'instagram.com' in url_lower:
                     error_msg = (
                         f"Instagram authentication required.\n\n"
                         f"Original error: {error_msg}\n\n"
