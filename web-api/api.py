@@ -1,5 +1,6 @@
 import os
 import logging
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,17 +34,6 @@ class UrlSubmission(BaseModel):
     url: str
     quality: str
 
-app = FastAPI(title="TeleVideo Converter API")
-
-# CORS configuration
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Database
 db = Database(DATABASE_PATH)
 
@@ -53,21 +43,29 @@ redis_client = None
 # WebSocket connections
 websocket_connections: List[WebSocket] = []
 
-@app.on_event("startup")
-async def startup():
-    """Initialize database and Redis on startup"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize and clean up database and Redis"""
     global redis_client
     await db.initialize()
     redis_client = await redis.from_url(f'redis://{REDIS_HOST}:{REDIS_PORT}')
     logger.info("Web API started successfully")
-
-@app.on_event("shutdown")
-async def shutdown():
-    """Close database and Redis on shutdown"""
+    yield
     await db.close()
     if redis_client:
-        await redis_client.close()
+        await redis_client.aclose()
     logger.info("Web API shutdown")
+
+app = FastAPI(title="TeleVideo Converter API", lifespan=lifespan)
+
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 async def root():

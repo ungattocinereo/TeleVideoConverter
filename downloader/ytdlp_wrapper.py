@@ -27,6 +27,29 @@ class VideoDownloader:
     def _reencode_video(self, input_path: str, video_id: str) -> str:
         """Force re-encode video with Telegram-compatible settings using ffmpeg"""
         output_path = os.path.join(self.videos_path, f"{video_id}_reencoded.mp4")
+        final_path = os.path.join(self.videos_path, f"{video_id}.mp4")
+
+        # Check file size before re-encoding
+        file_size = os.path.getsize(input_path)
+        file_size_mb = file_size / (1024 * 1024)
+
+        # Skip re-encoding for files over 50MB (Telegram Bot API limit)
+        # These will be sent via web interface link anyway
+        if file_size_mb > 50:
+            print(f"Skipping re-encode for large file ({file_size_mb:.1f}MB > 50MB): {video_id}")
+            # Just ensure it has .mp4 extension
+            if not input_path.endswith('.mp4'):
+                os.rename(input_path, final_path)
+                return final_path
+            return input_path
+
+        # Also skip re-encoding for very small files (< 1MB) - likely already optimized
+        if file_size_mb < 1:
+            print(f"Skipping re-encode for small file ({file_size_mb:.2f}MB): {video_id}")
+            if not input_path.endswith('.mp4'):
+                os.rename(input_path, final_path)
+                return final_path
+            return input_path
 
         # FFmpeg command with Telegram-compatible settings
         ffmpeg_cmd = [
@@ -55,33 +78,60 @@ class VideoDownloader:
         ]
 
         try:
-            print(f"Re-encoding video for Telegram compatibility: {video_id}")
+            print(f"Re-encoding video for Telegram compatibility: {video_id} ({file_size_mb:.1f}MB)")
+
+            # Calculate timeout based on file size (rough estimate: 2 minutes per 10MB, min 60s, max 10 minutes)
+            timeout_seconds = max(60, min(600, int(file_size_mb * 12)))
+            print(f"Re-encoding timeout set to {timeout_seconds}s")
+
             result = subprocess.run(
                 ffmpeg_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                check=True
+                check=True,
+                timeout=timeout_seconds  # Add timeout to prevent indefinite hanging
             )
 
-            # Remove original file and rename re-encoded file
+            # Remove original file and rename re-encoded file to .mp4
             if os.path.exists(output_path):
                 os.remove(input_path)
-                os.rename(output_path, input_path)
+                # Always rename to .mp4 extension
+                os.rename(output_path, final_path)
                 print(f"Re-encoding successful: {video_id}")
-                return input_path
+                return final_path
             else:
                 print(f"Re-encoding failed: output file not found")
                 return input_path
 
+        except subprocess.TimeoutExpired:
+            print(f"FFmpeg re-encoding timeout after {timeout_seconds}s for {video_id} ({file_size_mb:.1f}MB)")
+            # Clean up partial output file
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            # Return original file
+            return input_path
         except subprocess.CalledProcessError as e:
-            print(f"FFmpeg re-encoding error: {e.stderr.decode()}")
-            # Return original file if re-encoding fails
+            stderr_output = e.stderr.decode() if e.stderr else 'No stderr output'
+            print(f"FFmpeg re-encoding error: {stderr_output[:500]}")  # Truncate long errors
+            # Clean up partial output file
             if os.path.exists(output_path):
                 os.remove(output_path)
             return input_path
         except Exception as e:
             print(f"Re-encoding exception: {e}")
+            # Clean up partial output file
+            if os.path.exists(output_path):
+                os.remove(output_path)
             return input_path
+
+    def _find_video_file(self, video_id: str) -> Optional[str]:
+        """Find video file with any extension"""
+        video_extensions = ['.mp4', '.webm', '.mkv', '.avi', '.mov', '.flv', '.m4v']
+        for ext in video_extensions:
+            potential_path = os.path.join(self.videos_path, f"{video_id}{ext}")
+            if os.path.exists(potential_path):
+                return potential_path
+        return None
 
     def _get_cookie_file(self, url: str) -> Optional[str]:
         """Detect platform and return appropriate cookie file path"""
@@ -122,6 +172,33 @@ class VideoDownloader:
                 'no_warnings': False,
                 'extract_flat': False,
                 'writeinfojson': False,  # Don't write JSON file, just extract info
+                # Network resilience settings for large files and slow connections
+                'socket_timeout': 180,  # Socket timeout 3 minutes - very slow servers like 9gag
+                'retries': 20,  # Retry failed downloads - increased to 20
+                'fragment_retries': 30,  # Retry failed fragments - increased to 30 for problematic servers
+                'extractor_retries': 5,  # Retry failed metadata extraction
+                'file_access_retries': 5,  # Retry file access errors
+                'http_chunk_size': 5242880,  # 5MB chunks - smaller chunks for unstable connections
+                'nocheckcertificate': True,  # Ignore SSL certificate errors
+                'retry_sleep_functions': {
+                    'http': lambda n: min(60, 3 ** n),  # More aggressive backoff: 3s, 9s, 27s, 60s max
+                    'fragment': lambda n: min(60, 3 ** n),  # More aggressive backoff
+                    'file_access': lambda n: min(60, 3 ** n),  # More aggressive backoff
+                    'extractor': lambda n: min(60, 3 ** n),  # More aggressive backoff
+                },
+                # Continue downloads even if errors occur
+                'ignoreerrors': False,  # Don't ignore errors, but retry instead
+                'no_color': True,  # Disable colored output for cleaner logs
+                # Additional headers to avoid bot detection
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                },
             }
 
             if is_audio_only:
@@ -131,23 +208,62 @@ class VideoDownloader:
                     'preferredquality': '192',
                 }]
             else:
-                # Just merge to MP4, we'll force re-encode manually after download
+                # Merge to MP4 and recode non-mp4 formats (like webm from 9gag)
                 ydl_opts['merge_output_format'] = 'mp4'
+                ydl_opts['postprocessors'] = [{
+                    'key': 'FFmpegVideoConvertor',
+                    'preferedformat': 'mp4',
+                }]
 
             # Add cookie support
             cookie_file = self._get_cookie_file(url)
             if cookie_file:
                 ydl_opts['cookiefile'] = cookie_file
 
+            # Add progress hook for better logging
+            def progress_hook(d):
+                if d['status'] == 'downloading':
+                    if 'total_bytes' in d:
+                        percent = (d['downloaded_bytes'] / d['total_bytes']) * 100
+                        print(f"Download progress: {percent:.1f}% ({d['downloaded_bytes']}/{d['total_bytes']} bytes)")
+                    elif 'downloaded_bytes' in d:
+                        print(f"Downloaded: {d['downloaded_bytes']} bytes")
+                elif d['status'] == 'finished':
+                    print(f"Download finished, now post-processing...")
+                elif d['status'] == 'error':
+                    print(f"Download error occurred")
+
+            ydl_opts['progress_hooks'] = [progress_hook]
+
             # Download video
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
+
+                # Handle playlists (e.g. Twitter threads with multiple videos)
+                # When yt-dlp returns a playlist, process the first video entry
+                if info.get('_type') == 'playlist' or 'entries' in info:
+                    entries = info.get('entries', [])
+                    if entries:
+                        # Use the first entry as the main video
+                        info = entries[0]
+                        print(f"Playlist detected with {len(entries)} entries, using first: {info.get('id')}")
+                    else:
+                        return {
+                            'success': False,
+                            'error': 'Playlist is empty — no downloadable videos found'
+                        }
 
                 # Get video information
                 video_id = info['id']
                 title = info['title']
                 ext = 'mp3' if is_audio_only else 'mp4'
                 file_path = os.path.join(self.videos_path, f"{video_id}.{ext}")
+
+                # If expected file doesn't exist, search for file with any extension
+                if not is_audio_only and not os.path.exists(file_path):
+                    file_path = self._find_video_file(video_id)
+                    if file_path:
+                        print(f"Found video file: {file_path}")
 
                 # Get original quality
                 original_quality = None
@@ -156,7 +272,8 @@ class VideoDownloader:
 
                 # FORCE re-encode video for Telegram compatibility
                 # This ensures Instagram and other videos work correctly on iOS/macOS
-                if not is_audio_only and os.path.exists(file_path):
+                # Also converts non-mp4 formats (webm, mkv) to mp4
+                if not is_audio_only and file_path and os.path.exists(file_path):
                     file_path = self._reencode_video(file_path, video_id)
 
                 # Get file size (after re-encoding)
