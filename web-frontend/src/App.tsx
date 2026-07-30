@@ -88,16 +88,13 @@ function App() {
   // Download video
   const handleDownload = async (video: Video) => {
     try {
-      const response = await fetch(`${API_URL}/api/videos/${video.video_id}/download`)
-      const blob = await response.blob()
-      const url = window.URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `${video.title}.${video.format}`
-      document.body.appendChild(a)
-      a.click()
-      window.URL.revokeObjectURL(url)
-      document.body.removeChild(a)
+      // Use direct link instead of fetch+blob to avoid memory issues with large files
+      const link = document.createElement('a')
+      link.href = `${API_URL}/api/videos/${video.video_id}/download`
+      link.download = `${video.title}.${video.format}`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
     } catch (error) {
       console.error('Error downloading video:', error)
       alert('Error downloading video')

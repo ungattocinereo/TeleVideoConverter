@@ -165,9 +165,10 @@ async def download_video(video_id: str):
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="Video file not found")
 
-        # Determine filename
+        # Determine filename - sanitize title for Content-Disposition header
         ext = os.path.splitext(file_path)[1]
-        filename = f"{video['title']}{ext}"
+        safe_title = "".join(c for c in video['title'] if c.isalnum() or c in ' ._-').strip() or 'video'
+        filename = f"{safe_title}{ext}"
 
         # Stream the file
         return FileResponse(

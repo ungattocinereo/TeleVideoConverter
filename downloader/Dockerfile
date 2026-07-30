@@ -2,9 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install ffmpeg and build dependencies for curl-cffi
+# Install ffmpeg, nodejs (JS runtime for yt-dlp extractors), and build dependencies for curl-cffi
 RUN apt-get update && \
-    apt-get install -y ffmpeg gcc libcurl4-openssl-dev libssl-dev && \
+    apt-get install -y ffmpeg nodejs gcc libcurl4-openssl-dev libssl-dev && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 

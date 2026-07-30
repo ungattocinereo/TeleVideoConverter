@@ -1,7 +1,10 @@
 import os
+import re
+import time
 import yt_dlp
 import subprocess
-from typing import Dict, Optional
+import requests
+from typing import Callable, Dict, Optional
 from PIL import Image
 
 class VideoDownloader:
@@ -33,17 +36,7 @@ class VideoDownloader:
         file_size = os.path.getsize(input_path)
         file_size_mb = file_size / (1024 * 1024)
 
-        # Skip re-encoding for files over 50MB (Telegram Bot API limit)
-        # These will be sent via web interface link anyway
-        if file_size_mb > 50:
-            print(f"Skipping re-encode for large file ({file_size_mb:.1f}MB > 50MB): {video_id}")
-            # Just ensure it has .mp4 extension
-            if not input_path.endswith('.mp4'):
-                os.rename(input_path, final_path)
-                return final_path
-            return input_path
-
-        # Also skip re-encoding for very small files (< 1MB) - likely already optimized
+        # Skip re-encoding for very small files (< 1MB) - likely already optimized
         if file_size_mb < 1:
             print(f"Skipping re-encode for small file ({file_size_mb:.2f}MB): {video_id}")
             if not input_path.endswith('.mp4'):
@@ -80,8 +73,8 @@ class VideoDownloader:
         try:
             print(f"Re-encoding video for Telegram compatibility: {video_id} ({file_size_mb:.1f}MB)")
 
-            # Calculate timeout based on file size (rough estimate: 2 minutes per 10MB, min 60s, max 10 minutes)
-            timeout_seconds = max(60, min(600, int(file_size_mb * 12)))
+            # Calculate timeout based on file size (rough estimate: 2 minutes per 10MB, min 60s, max 1 hour)
+            timeout_seconds = max(60, min(3600, int(file_size_mb * 12)))
             print(f"Re-encoding timeout set to {timeout_seconds}s")
 
             result = subprocess.run(
@@ -142,6 +135,7 @@ class VideoDownloader:
         platform_map = {
             'instagram.com': 'instagram.txt',
             'facebook.com': 'facebook.txt',
+            'fb.watch': 'facebook.txt',
             'twitter.com': 'twitter.txt',
             'x.com': 'twitter.txt',
             'tiktok.com': 'tiktok.txt',
@@ -158,7 +152,129 @@ class VideoDownloader:
 
         return None
 
-    async def download(self, url: str, quality: str) -> Dict:
+    def _is_facebook_url(self, url: str) -> bool:
+        url_lower = url.lower()
+        return 'facebook.com' in url_lower or 'fb.watch' in url_lower
+
+    def _is_tiktok_url(self, url: str) -> bool:
+        return 'tiktok.com' in url.lower()
+
+    def _resolve_tiktok_video(self, url: str) -> tuple[str, str]:
+        """Resolve TikTok short URLs and return the video ID and canonical URL."""
+        video_match = re.search(r'/video/(\d+)', url)
+        if video_match:
+            return video_match.group(1), url
+
+        with requests.get(
+            url,
+            allow_redirects=True,
+            headers=self._default_http_headers(),
+            stream=True,
+            timeout=30,
+        ) as response:
+            redirect_urls = [item.url for item in response.history]
+            redirect_urls.append(response.url)
+
+            for redirect_url in redirect_urls:
+                video_match = re.search(r'/video/(\d+)', redirect_url)
+                if video_match:
+                    return video_match.group(1), redirect_url
+
+            response.raise_for_status()
+
+        raise ValueError('Unable to resolve TikTok video ID from URL')
+
+    def _get_tiktok_oembed_metadata(self, canonical_url: str) -> Dict:
+        """Fetch public TikTok metadata used to enrich the embed fallback."""
+        try:
+            response = requests.get(
+                'https://www.tiktok.com/oembed',
+                params={'url': canonical_url},
+                headers=self._default_http_headers(),
+                timeout=30,
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"TikTok oEmbed metadata unavailable: {e}")
+            return {}
+
+    def _should_use_tiktok_embed_fallback(self, url: str, error: Exception) -> bool:
+        if not self._is_tiktok_url(url):
+            return False
+
+        error_text = str(error).lower()
+        return any(message in error_text for message in (
+            'tiktok is requiring login',
+            'unable to extract universal data',
+            'video not available, status code -1',
+        ))
+
+    def _extract_info(self, url: str, ydl_opts: Dict) -> Dict:
+        """Extract normally, with an official TikTok embed fallback for login redirects."""
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=True)
+        except yt_dlp.utils.DownloadError as original_error:
+            if not self._should_use_tiktok_embed_fallback(url, original_error):
+                raise
+
+            try:
+                video_id, canonical_url = self._resolve_tiktok_video(url)
+                embed_url = f'https://www.tiktok.com/embed/v2/{video_id}'
+                metadata = self._get_tiktok_oembed_metadata(canonical_url)
+
+                fallback_opts = dict(ydl_opts)
+                fallback_opts.pop('cookiefile', None)
+                fallback_opts.pop('http_headers', None)
+                fallback_opts.update({
+                    'playlist_items': '1',
+                    'writethumbnail': False,
+                    'outtmpl': os.path.join(self.videos_path, f'{video_id}.%(ext)s'),
+                })
+
+                print(
+                    f"TikTok webpage requires login; retrying public video {video_id} "
+                    "through the official embed endpoint"
+                )
+                with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+                    info = ydl.extract_info(embed_url, download=True)
+
+                entries = info.get('entries') or []
+                if entries:
+                    entry = entries[0]
+                    entry.update({
+                        'id': video_id,
+                        'title': metadata.get('title') or entry.get('title') or f'TikTok {video_id}',
+                        'description': metadata.get('title') or entry.get('description') or '',
+                        'uploader': metadata.get('author_name') or entry.get('uploader'),
+                        'uploader_url': metadata.get('author_url') or entry.get('uploader_url'),
+                        'thumbnail': metadata.get('thumbnail_url') or entry.get('thumbnail'),
+                        'extractor_key': 'TikTok',
+                    })
+
+                return info
+            except Exception as fallback_error:
+                print(f"TikTok embed fallback failed: {fallback_error}")
+                raise original_error from fallback_error
+
+    def _default_http_headers(self) -> Dict[str, str]:
+        return {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
+
+    async def download(
+        self,
+        url: str,
+        quality: str,
+        progress_callback: Optional[Callable[[Dict], None]] = None,
+    ) -> Dict:
         """Download video from URL"""
         try:
             is_audio_only = quality == 'audio'
@@ -189,17 +305,13 @@ class VideoDownloader:
                 # Continue downloads even if errors occur
                 'ignoreerrors': False,  # Don't ignore errors, but retry instead
                 'no_color': True,  # Disable colored output for cleaner logs
-                # Additional headers to avoid bot detection
-                'http_headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'DNT': '1',
-                    'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1',
-                },
             }
+
+            if self._is_facebook_url(url):
+                print("Using yt-dlp default headers for Facebook URL")
+            else:
+                # Additional headers to avoid bot detection on platforms that tolerate them.
+                ydl_opts['http_headers'] = self._default_http_headers()
 
             if is_audio_only:
                 ydl_opts['postprocessors'] = [{
@@ -220,14 +332,53 @@ class VideoDownloader:
             if cookie_file:
                 ydl_opts['cookiefile'] = cookie_file
 
-            # Add progress hook for better logging
+            # Add a throttled hook for logs and the Telegram progress display.
+            last_progress_emit = 0.0
+            last_progress_phase = None
+
+            def emit_progress(payload: Dict):
+                if not progress_callback:
+                    return
+                try:
+                    progress_callback(payload)
+                except Exception as progress_error:
+                    print(f"Progress callback failed: {progress_error}")
+
             def progress_hook(d):
+                nonlocal last_progress_emit, last_progress_phase
                 if d['status'] == 'downloading':
-                    if 'total_bytes' in d:
-                        percent = (d['downloaded_bytes'] / d['total_bytes']) * 100
-                        print(f"Download progress: {percent:.1f}% ({d['downloaded_bytes']}/{d['total_bytes']} bytes)")
-                    elif 'downloaded_bytes' in d:
-                        print(f"Downloaded: {d['downloaded_bytes']} bytes")
+                    downloaded_bytes = d.get('downloaded_bytes', 0)
+                    total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate')
+                    percent = None
+                    if total_bytes:
+                        percent = (downloaded_bytes / total_bytes) * 100
+                        print(f"Download progress: {percent:.1f}% ({downloaded_bytes}/{total_bytes} bytes)")
+                    else:
+                        print(f"Downloaded: {downloaded_bytes} bytes")
+
+                    info_dict = d.get('info_dict') or {}
+                    vcodec = info_dict.get('vcodec')
+                    acodec = info_dict.get('acodec')
+                    if is_audio_only or (vcodec == 'none' and acodec not in (None, 'none')):
+                        phase = 'audio'
+                    elif acodec == 'none' and vcodec not in (None, 'none'):
+                        phase = 'video'
+                    else:
+                        phase = 'media'
+
+                    now = time.monotonic()
+                    if phase != last_progress_phase or now - last_progress_emit >= 1:
+                        emit_progress({
+                            'state': 'working',
+                            'phase': phase,
+                            'percent': percent,
+                            'downloaded_bytes': downloaded_bytes,
+                            'total_bytes': total_bytes,
+                            'speed': d.get('speed'),
+                            'eta': d.get('eta'),
+                        })
+                        last_progress_emit = now
+                        last_progress_phase = phase
                 elif d['status'] == 'finished':
                     print(f"Download finished, now post-processing...")
                 elif d['status'] == 'error':
@@ -236,90 +387,94 @@ class VideoDownloader:
             ydl_opts['progress_hooks'] = [progress_hook]
 
             # Download video
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+            info = self._extract_info(url, ydl_opts)
+            emit_progress({
+                'state': 'working',
+                'phase': 'processing',
+                'percent': 100.0,
+            })
 
-                # Handle playlists (e.g. Twitter threads with multiple videos)
-                # When yt-dlp returns a playlist, process the first video entry
-                if info.get('_type') == 'playlist' or 'entries' in info:
-                    entries = info.get('entries', [])
-                    if entries:
-                        # Use the first entry as the main video
-                        info = entries[0]
-                        print(f"Playlist detected with {len(entries)} entries, using first: {info.get('id')}")
-                    else:
-                        return {
-                            'success': False,
-                            'error': 'Playlist is empty — no downloadable videos found'
-                        }
+            # Handle playlists (e.g. Twitter threads with multiple videos)
+            # When yt-dlp returns a playlist, process the first video entry
+            if info.get('_type') == 'playlist' or 'entries' in info:
+                entries = info.get('entries', [])
+                if entries:
+                    # Use the first entry as the main video
+                    info = entries[0]
+                    print(f"Playlist detected with {len(entries)} entries, using first: {info.get('id')}")
+                else:
+                    return {
+                        'success': False,
+                        'error': 'Playlist is empty — no downloadable videos found'
+                    }
 
-                # Get video information
-                video_id = info['id']
-                title = info['title']
-                ext = 'mp3' if is_audio_only else 'mp4'
-                file_path = os.path.join(self.videos_path, f"{video_id}.{ext}")
+            # Get video information
+            video_id = info['id']
+            title = info['title']
+            ext = 'mp3' if is_audio_only else 'mp4'
+            file_path = os.path.join(self.videos_path, f"{video_id}.{ext}")
 
-                # If expected file doesn't exist, search for file with any extension
-                if not is_audio_only and not os.path.exists(file_path):
-                    file_path = self._find_video_file(video_id)
-                    if file_path:
-                        print(f"Found video file: {file_path}")
+            # If expected file doesn't exist, search for file with any extension
+            if not is_audio_only and not os.path.exists(file_path):
+                file_path = self._find_video_file(video_id)
+                if file_path:
+                    print(f"Found video file: {file_path}")
 
-                # Get original quality
-                original_quality = None
-                if not is_audio_only and 'height' in info:
-                    original_quality = f"{info['width']}x{info['height']} ({info['height']}p)"
+            # Get original quality
+            original_quality = None
+            if not is_audio_only and info.get('height') and info.get('width'):
+                original_quality = f"{info['width']}x{info['height']} ({info['height']}p)"
 
-                # FORCE re-encode video for Telegram compatibility
-                # This ensures Instagram and other videos work correctly on iOS/macOS
-                # Also converts non-mp4 formats (webm, mkv) to mp4
-                if not is_audio_only and file_path and os.path.exists(file_path):
-                    file_path = self._reencode_video(file_path, video_id)
+            # FORCE re-encode video for Telegram compatibility
+            # This ensures Instagram and other videos work correctly on iOS/macOS
+            # Also converts non-mp4 formats (webm, mkv) to mp4
+            if not is_audio_only and file_path and os.path.exists(file_path):
+                file_path = self._reencode_video(file_path, video_id)
 
-                # Get file size (after re-encoding)
-                file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+            # Get file size (after re-encoding)
+            file_size = os.path.getsize(file_path) if file_path and os.path.exists(file_path) else 0
 
-                # Process thumbnail
-                thumbnail_path = None
-                if not is_audio_only:
-                    thumbnail_path = self._process_thumbnail(video_id, info)
+            # Process thumbnail
+            thumbnail_path = None
+            if not is_audio_only:
+                thumbnail_path = self._process_thumbnail(video_id, info)
 
-                # Get source platform
-                source_platform = info.get('extractor_key', 'Unknown')
+            # Get source platform
+            source_platform = info.get('extractor_key', 'Unknown')
 
-                # Get codec info
-                codec = None
-                width = None
-                height = None
-                if not is_audio_only:
-                    codec = info.get('vcodec', 'unknown')
-                    width = info.get('width')
-                    height = info.get('height')
+            # Get codec info
+            codec = None
+            width = None
+            height = None
+            if not is_audio_only:
+                codec = info.get('vcodec', 'unknown')
+                width = info.get('width')
+                height = info.get('height')
 
-                # Get description (try multiple fields for different platforms)
-                # Instagram uses 'description', YouTube uses 'description', TikTok might use 'description' or 'title'
-                description = (
-                    info.get('description') or
-                    info.get('caption') or
-                    info.get('alt_title') or
-                    ''
-                )
+            # Get description (try multiple fields for different platforms)
+            # Instagram uses 'description', YouTube uses 'description', TikTok might use 'description' or 'title'
+            description = (
+                info.get('description') or
+                info.get('caption') or
+                info.get('alt_title') or
+                ''
+            )
 
-                return {
-                    'success': True,
-                    'video_id': video_id,
-                    'title': title,
-                    'original_quality': original_quality,
-                    'file_path': file_path,
-                    'file_size': file_size,
-                    'format': ext,
-                    'codec': codec,
-                    'source_platform': source_platform,
-                    'thumbnail_path': thumbnail_path,
-                    'width': width,
-                    'height': height,
-                    'description': description
-                }
+            return {
+                'success': True,
+                'video_id': video_id,
+                'title': title,
+                'original_quality': original_quality,
+                'file_path': file_path,
+                'file_size': file_size,
+                'format': ext,
+                'codec': codec,
+                'source_platform': source_platform,
+                'thumbnail_path': thumbnail_path,
+                'width': width,
+                'height': height,
+                'description': description
+            }
 
         except Exception as e:
             error_msg = str(e)
