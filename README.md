@@ -178,6 +178,12 @@ All configuration is done via `.env`:
 - `DATABASE_PATH` - SQLite database path (default: /db/televideo.db)
 - `API_PORT` - Web API port (default: 3001)
 - `LOG_LEVEL` - Logging level (default: INFO)
+- `TELEGRAM_SEND_LIMIT_MB` - Telegram cloud Bot API upload limit (default: 50)
+- `TELEGRAM_TARGET_MB` - Target size for compressed Telegram video parts (default: 48)
+- `TELEGRAM_MIN_VIDEO_BITRATE_K` - Minimum video bitrate before splitting into parts (default: 250)
+- `TELEGRAM_AUDIO_BITRATE_K` - Audio bitrate for compressed Telegram copies (default: 64)
+- `TELEGRAM_LARGE_FILE_POLICY` - Large video handling strategy (default: compress_then_split)
+- `WEB_PUBLIC_URL` - Fallback download URL shown if Telegram upload fails
 
 ## Storage Structure
 
@@ -246,6 +252,18 @@ Every downloaded video is **automatically re-encoded** with:
 ✅ Universal compatibility across all Telegram clients
 
 The re-encoding process adds 5-10 seconds to download time but **guarantees** your videos will play correctly everywhere.
+
+### Large Telegram Uploads
+
+Telegram's cloud Bot API accepts uploaded video files up to 50MB. If a downloaded
+video is larger than the configured target size, the downloader now creates a
+temporary Telegram copy instead of changing the stored web copy:
+
+- compresses to H.264 Baseline + AAC with `faststart`
+- caps the longest side at 720p, lowering to 540p/480p/360p when bitrate is tight
+- calculates bitrate from the target size and video duration
+- splits very long videos into multiple Telegram-sized parts
+- falls back to the web interface link if compression or upload fails
 
 ## Troubleshooting
 

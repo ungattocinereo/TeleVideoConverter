@@ -28,6 +28,12 @@ services:
   downloader:
     build: ./downloader
     env_file: .env
+    environment:
+      TELEGRAM_SEND_LIMIT_MB: ${TELEGRAM_SEND_LIMIT_MB:-50}
+      TELEGRAM_TARGET_MB: ${TELEGRAM_TARGET_MB:-48}
+      TELEGRAM_MIN_VIDEO_BITRATE_K: ${TELEGRAM_MIN_VIDEO_BITRATE_K:-250}
+      TELEGRAM_AUDIO_BITRATE_K: ${TELEGRAM_AUDIO_BITRATE_K:-64}
+      TELEGRAM_LARGE_FILE_POLICY: ${TELEGRAM_LARGE_FILE_POLICY:-compress_then_split}
     depends_on:
       redis:
         condition: service_healthy
