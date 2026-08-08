@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import time
@@ -5,9 +6,35 @@ import yt_dlp
 import subprocess
 import requests
 from typing import Callable, Dict, Optional
+from urllib.parse import urlparse
 from PIL import Image
 
 class VideoDownloader:
+    THREADS_ENCODING_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+    THREADS_GRAPHQL_DOC_ID = '26742885138663415'
+    THREADS_GRAPHQL_FRIENDLY_NAME = 'BarcelonaPermalinkMobilePostColumnPageQuery'
+    THREADS_GRAPHQL_BOOL_PROVIDERS = (
+        'BarcelonaHasDearAlgoConsumption',
+        'BarcelonaIsLoggedIn',
+        'BarcelonaHasEventBadge',
+        'BarcelonaThreadsWebCachingImprovements',
+        'BarcelonaIsSearchDiscoveryEnabled',
+        'BarcelonaHasCommunities',
+        'BarcelonaHasGameScoreShare',
+        'BarcelonaHasPublicViewCountCard',
+        'BarcelonaHasScorecardCommunity',
+        'BarcelonaHasMusic',
+        'BarcelonaHasGhostPostEmojiActivation',
+        'BarcelonaOptionalCookiesEnabled',
+        'BarcelonaHasDearAlgoWebProduction',
+        'BarcelonaIsCrawler',
+        'BarcelonaHasDisplayNames',
+        'BarcelonaHasCommunityTopContributors',
+        'BarcelonaCanSeeSponsoredContent',
+        'BarcelonaShouldShowFediverseM075Features',
+        'BarcelonaIsInternalUser',
+    )
+
     def __init__(self, storage_path: str, cookies_path: str = None):
         self.storage_path = storage_path
         self.cookies_path = cookies_path
@@ -159,6 +186,130 @@ class VideoDownloader:
     def _is_tiktok_url(self, url: str) -> bool:
         return 'tiktok.com' in url.lower()
 
+    def _is_threads_url(self, url: str) -> bool:
+        hostname = (urlparse(url).hostname or '').lower()
+        return any(
+            hostname == domain or hostname.endswith(f'.{domain}')
+            for domain in ('threads.com', 'threads.net')
+        )
+
+    def _decode_threads_shortcode(self, shortcode: str) -> int:
+        """Convert a Threads shortcode to the numeric post ID used by its API."""
+        post_id = 0
+        for character in shortcode:
+            try:
+                value = self.THREADS_ENCODING_CHARS.index(character)
+            except ValueError as error:
+                raise ValueError(f'Invalid Threads shortcode: {shortcode}') from error
+            post_id = post_id * len(self.THREADS_ENCODING_CHARS) + value
+        return post_id
+
+    def _resolve_threads_post(self, url: str) -> tuple[str, str]:
+        """Resolve Threads share links and return the canonical URL and shortcode."""
+        match = re.search(r'/(?:post|t)/([A-Za-z0-9_-]+)', url)
+        if match:
+            return url, match.group(1)
+
+        response = requests.get(
+            url,
+            allow_redirects=True,
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        canonical_url = response.url
+        match = re.search(r'/(?:post|t)/([A-Za-z0-9_-]+)', canonical_url)
+        if not match:
+            raise ValueError('Unable to resolve Threads post shortcode from share URL')
+        return canonical_url, match.group(1)
+
+    def _get_threads_media(self, canonical_url: str, shortcode: str) -> Dict:
+        """Fetch public Threads post metadata from the same API used by its web app."""
+        variables = {
+            'postID': str(self._decode_threads_shortcode(shortcode)),
+            **{
+                f'__relay_internal__pv__{provider}relayprovider': False
+                for provider in self.THREADS_GRAPHQL_BOOL_PROVIDERS
+            },
+        }
+        headers = {
+            'User-Agent': 'Mozilla/5.0',
+            'X-FB-Friendly-Name': self.THREADS_GRAPHQL_FRIENDLY_NAME,
+            'X-FB-LSD': '1',
+            'X-IG-App-ID': '238260118697367',
+        }
+        response = requests.post(
+            'https://www.threads.com/api/graphql',
+            data={
+                'lsd': '1',
+                'variables': json.dumps(variables, separators=(',', ':')),
+                'doc_id': self.THREADS_GRAPHQL_DOC_ID,
+            },
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        media = payload.get('data', {}).get('media')
+        if not media:
+            api_errors = payload.get('errors') or []
+            api_message = api_errors[0].get('message') if api_errors else None
+            raise ValueError(api_message or 'Threads API returned no post media')
+        return media
+
+    def _extract_threads_info(self, url: str, ydl_opts: Dict) -> Dict:
+        """Build a yt-dlp info dictionary for Threads and download its first video."""
+        canonical_url, shortcode = self._resolve_threads_post(url)
+        media = self._get_threads_media(canonical_url, shortcode)
+        media_items = media.get('carousel_media') or [media]
+        video_media = next(
+            (item for item in media_items if item.get('video_versions')),
+            None,
+        )
+        if not video_media:
+            raise ValueError('This Threads post contains no downloadable video')
+
+        user = media.get('user') or {}
+        uploader = user.get('username')
+        caption = (media.get('caption') or {}).get('text')
+        title = caption or f'Threads video by {uploader or "unknown user"}'
+        thumbnail_candidates = (
+            (video_media.get('image_versions2') or {}).get('candidates') or []
+        )
+        formats = [
+            {
+                'format_id': str(video.get('type')) if video.get('type') is not None else None,
+                'url': video.get('url'),
+                'width': video_media.get('original_width'),
+                'height': video_media.get('original_height'),
+                'http_headers': {'Referer': 'https://www.threads.com/'},
+            }
+            for video in video_media['video_versions']
+            if video.get('url')
+        ]
+        if not formats:
+            raise ValueError('Threads API returned no downloadable video formats')
+
+        info = {
+            'id': shortcode,
+            'title': title,
+            'description': caption or '',
+            'webpage_url': canonical_url,
+            'extractor': 'Threads',
+            'extractor_key': 'Threads',
+            'formats': formats,
+            'thumbnail': thumbnail_candidates[0].get('url') if thumbnail_candidates else None,
+            'uploader': uploader,
+            'uploader_id': user.get('pk') or user.get('id'),
+            'timestamp': media.get('taken_at'),
+            'like_count': media.get('like_count'),
+            'comment_count': (media.get('text_post_app_info') or {}).get('direct_reply_count'),
+        }
+
+        print(f'Downloading Threads post {shortcode} through the Threads web API')
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.process_ie_result(info, download=True)
+
     def _resolve_tiktok_video(self, url: str) -> tuple[str, str]:
         """Resolve TikTok short URLs and return the video ID and canonical URL."""
         video_match = re.search(r'/video/(\d+)', url)
@@ -212,6 +363,9 @@ class VideoDownloader:
 
     def _extract_info(self, url: str, ydl_opts: Dict) -> Dict:
         """Extract normally, with an official TikTok embed fallback for login redirects."""
+        if self._is_threads_url(url):
+            return self._extract_threads_info(url, ydl_opts)
+
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(url, download=True)
