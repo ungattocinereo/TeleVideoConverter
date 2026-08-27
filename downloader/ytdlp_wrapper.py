@@ -1,9 +1,11 @@
+import html
 import json
 import os
 import re
 import time
 import yt_dlp
 import subprocess
+import tempfile
 import requests
 from typing import Callable, Dict, Optional
 from urllib.parse import urlparse
@@ -310,11 +312,11 @@ class VideoDownloader:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.process_ie_result(info, download=True)
 
-    def _resolve_tiktok_video(self, url: str) -> tuple[str, str]:
-        """Resolve TikTok short URLs and return the video ID and canonical URL."""
-        video_match = re.search(r'/video/(\d+)', url)
-        if video_match:
-            return video_match.group(1), url
+    def _resolve_tiktok_post(self, url: str) -> tuple[str, str, str]:
+        """Resolve TikTok short URLs and return post type, ID, and canonical URL."""
+        post_match = re.search(r'/(video|photo)/(\d+)', url)
+        if post_match:
+            return post_match.group(1), post_match.group(2), url
 
         with requests.get(
             url,
@@ -327,13 +329,266 @@ class VideoDownloader:
             redirect_urls.append(response.url)
 
             for redirect_url in redirect_urls:
-                video_match = re.search(r'/video/(\d+)', redirect_url)
-                if video_match:
-                    return video_match.group(1), redirect_url
+                post_match = re.search(r'/(video|photo)/(\d+)', redirect_url)
+                if post_match:
+                    return post_match.group(1), post_match.group(2), redirect_url
 
             response.raise_for_status()
 
-        raise ValueError('Unable to resolve TikTok video ID from URL')
+        raise ValueError('Unable to resolve TikTok post ID from URL')
+
+    def _resolve_tiktok_video(self, url: str) -> tuple[str, str]:
+        """Resolve TikTok short URLs and return the video ID and canonical URL."""
+        post_type, post_id, canonical_url = self._resolve_tiktok_post(url)
+        if post_type != 'video':
+            raise ValueError('TikTok URL points to a photo post, not a video')
+        return post_id, canonical_url
+
+    def _get_tiktok_embed_video_data(self, post_id: str) -> Dict:
+        """Read public post data from TikTok's official embed page."""
+        embed_url = f'https://www.tiktok.com/embed/v2/{post_id}'
+        response = requests.get(
+            embed_url,
+            headers=self._default_http_headers(),
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        state_match = re.search(
+            r'<script[^>]+id=["\']__FRONTITY_CONNECT_STATE__["\'][^>]*>(.*?)</script>',
+            response.text,
+            re.DOTALL,
+        )
+        if not state_match:
+            raise ValueError('TikTok embed page returned no post data')
+
+        state = json.loads(html.unescape(state_match.group(1)))
+        source_data = (state.get('source') or {}).get('data') or {}
+        page_data = source_data.get(f'/embed/v2/{post_id}') or {}
+        video_data = page_data.get('videoData')
+        if not video_data:
+            raise ValueError('TikTok embed page returned no video data')
+        return video_data
+
+    def _download_url_candidates(
+        self,
+        urls: list[str],
+        destination: str,
+        referer: str,
+    ) -> None:
+        """Download the first working TikTok CDN URL from a candidate list."""
+        headers = {
+            'User-Agent': self._default_http_headers()['User-Agent'],
+            'Referer': referer,
+        }
+        last_error = None
+        for candidate in urls:
+            if not candidate:
+                continue
+            try:
+                with requests.get(
+                    candidate,
+                    headers=headers,
+                    stream=True,
+                    timeout=60,
+                ) as response:
+                    response.raise_for_status()
+                    with open(destination, 'wb') as output_file:
+                        for chunk in response.iter_content(chunk_size=1024 * 256):
+                            if chunk:
+                                output_file.write(chunk)
+                return
+            except Exception as error:
+                last_error = error
+
+        raise RuntimeError(f'All TikTok CDN URLs failed: {last_error}')
+
+    def _create_tiktok_audio(
+        self,
+        post_id: str,
+        music_urls: list[str],
+        referer: str,
+    ) -> str:
+        """Download a TikTok photo post's soundtrack as MP3."""
+        if not music_urls:
+            raise ValueError('TikTok photo post has no downloadable soundtrack')
+
+        final_path = os.path.join(self.videos_path, f'{post_id}.mp3')
+        with tempfile.TemporaryDirectory(
+            prefix=f'tiktok-{post_id}-',
+            dir=self.videos_path,
+        ) as temp_dir:
+            source_path = os.path.join(temp_dir, 'soundtrack')
+            self._download_url_candidates(music_urls, source_path, referer)
+            result = subprocess.run(
+                [
+                    'ffmpeg', '-y', '-i', source_path,
+                    '-vn', '-c:a', 'libmp3lame', '-b:a', '192k',
+                    final_path,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=300,
+            )
+            if result.returncode != 0 or not os.path.exists(final_path):
+                error = result.stderr.decode(errors='replace')[-1000:]
+                raise RuntimeError(f'Could not convert TikTok soundtrack: {error}')
+        return final_path
+
+    def _create_tiktok_slideshow(
+        self,
+        post_id: str,
+        images: list[Dict],
+        music_urls: list[str],
+        referer: str,
+    ) -> tuple[str, int, int]:
+        """Render a TikTok photo post to a Telegram-compatible MP4."""
+        final_path = os.path.join(self.videos_path, f'{post_id}.mp4')
+        slide_seconds = 2.5
+
+        portrait_count = sum(
+            1 for image in images
+            if (image.get('height') or 0) > (image.get('width') or 0)
+        )
+        landscape_count = sum(
+            1 for image in images
+            if (image.get('width') or 0) > (image.get('height') or 0)
+        )
+        if portrait_count > landscape_count:
+            width, height = 720, 1280
+        elif landscape_count > portrait_count:
+            width, height = 1280, 720
+        else:
+            width, height = 720, 720
+
+        with tempfile.TemporaryDirectory(
+            prefix=f'tiktok-{post_id}-',
+            dir=self.videos_path,
+        ) as temp_dir:
+            slide_paths = []
+            for index, image_data in enumerate(images):
+                image_urls = image_data.get('urlList') or []
+                slide_path = os.path.join(temp_dir, f'slide-{index:03d}.jpg')
+                try:
+                    self._download_url_candidates(image_urls, slide_path, referer)
+                    slide_paths.append(slide_path)
+                except Exception as error:
+                    print(f'TikTok slide {index + 1} could not be downloaded: {error}')
+
+            if not slide_paths:
+                raise ValueError('TikTok photo post has no downloadable images')
+
+            thumbnail_path = os.path.join(self.videos_path, f'{post_id}.jpg')
+            with Image.open(slide_paths[0]) as thumbnail:
+                if thumbnail.mode != 'RGB':
+                    thumbnail = thumbnail.convert('RGB')
+                thumbnail.save(thumbnail_path, 'JPEG', quality=90)
+
+            concat_path = os.path.join(temp_dir, 'slides.txt')
+            with open(concat_path, 'w', encoding='utf-8') as concat_file:
+                for slide_path in slide_paths:
+                    concat_file.write(f"file '{slide_path}'\n")
+                    concat_file.write(f'duration {slide_seconds}\n')
+                concat_file.write(f"file '{slide_paths[-1]}'\n")
+
+            soundtrack_path = None
+            if music_urls:
+                soundtrack_path = os.path.join(temp_dir, 'soundtrack')
+                try:
+                    self._download_url_candidates(music_urls, soundtrack_path, referer)
+                except Exception as error:
+                    print(f'TikTok soundtrack unavailable; rendering silently: {error}')
+                    soundtrack_path = None
+
+            ffmpeg_cmd = [
+                'ffmpeg', '-y',
+                '-f', 'concat', '-safe', '0', '-i', concat_path,
+            ]
+            if soundtrack_path:
+                ffmpeg_cmd.extend(['-i', soundtrack_path])
+            ffmpeg_cmd.extend([
+                '-vf', (
+                    f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
+                    f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,'
+                    'fps=30,format=yuv420p'
+                ),
+                '-c:v', 'libx264',
+                '-profile:v', 'baseline',
+                '-level', '3.0',
+                '-preset', 'medium',
+                '-crf', '23',
+                '-g', '50',
+                '-keyint_min', '25',
+            ])
+            if soundtrack_path:
+                ffmpeg_cmd.extend([
+                    '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
+                ])
+            ffmpeg_cmd.extend([
+                '-t', str(len(slide_paths) * slide_seconds),
+                '-movflags', '+faststart',
+                final_path,
+            ])
+
+            result = subprocess.run(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=600,
+            )
+            if result.returncode != 0 or not os.path.exists(final_path):
+                error = result.stderr.decode(errors='replace')[-1000:]
+                raise RuntimeError(f'Could not render TikTok slideshow: {error}')
+
+        return final_path, width, height
+
+    def _extract_tiktok_slideshow_info(
+        self,
+        post_id: str,
+        canonical_url: str,
+        audio_only: bool = False,
+    ) -> Dict:
+        """Download or render a TikTok photo post using its official embed data."""
+        video_data = self._get_tiktok_embed_video_data(post_id)
+        image_post_info = video_data.get('imagePostInfo') or {}
+        images = image_post_info.get('displayImages') or []
+        if not images:
+            raise ValueError('TikTok post does not contain a downloadable slideshow')
+
+        item_info = video_data.get('itemInfos') or {}
+        author_info = video_data.get('authorInfos') or {}
+        music_info = video_data.get('musicInfos') or {}
+        music_urls = music_info.get('playUrl') or []
+        referer = f'https://www.tiktok.com/embed/v2/{post_id}'
+        title = item_info.get('text') or f'TikTok photo post by {author_info.get("uniqueId") or "unknown user"}'
+
+        print(f'Downloading TikTok photo post {post_id} through the official embed endpoint')
+        if audio_only:
+            self._create_tiktok_audio(post_id, music_urls, referer)
+            width = height = None
+        else:
+            _, width, height = self._create_tiktok_slideshow(
+                post_id,
+                images,
+                music_urls,
+                referer,
+            )
+
+        return {
+            'id': post_id,
+            'title': title,
+            'description': item_info.get('text') or '',
+            'webpage_url': canonical_url,
+            'extractor': 'TikTok',
+            'extractor_key': 'TikTok',
+            'uploader': author_info.get('uniqueId'),
+            'uploader_id': author_info.get('userId'),
+            'timestamp': int(item_info['createTime']) if item_info.get('createTime') else None,
+            'width': width,
+            'height': height,
+            'vcodec': None if audio_only else 'h264',
+            '_telegram_compatible': not audio_only,
+        }
 
     def _get_tiktok_oembed_metadata(self, canonical_url: str) -> Dict:
         """Fetch public TikTok metadata used to enrich the embed fallback."""
@@ -361,20 +616,43 @@ class VideoDownloader:
             'video not available, status code -1',
         ))
 
-    def _extract_info(self, url: str, ydl_opts: Dict) -> Dict:
+    def _extract_info(
+        self,
+        url: str,
+        ydl_opts: Dict,
+        audio_only: bool = False,
+    ) -> Dict:
         """Extract normally, with an official TikTok embed fallback for login redirects."""
         if self._is_threads_url(url):
             return self._extract_threads_info(url, ydl_opts)
+
+        direct_photo_match = re.search(r'/photo/(\d+)', url)
+        if self._is_tiktok_url(url) and direct_photo_match:
+            return self._extract_tiktok_slideshow_info(
+                direct_photo_match.group(1),
+                url,
+                audio_only=audio_only,
+            )
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(url, download=True)
         except yt_dlp.utils.DownloadError as original_error:
-            if not self._should_use_tiktok_embed_fallback(url, original_error):
+            if not self._is_tiktok_url(url):
                 raise
 
             try:
-                video_id, canonical_url = self._resolve_tiktok_video(url)
+                post_type, video_id, canonical_url = self._resolve_tiktok_post(url)
+                if post_type == 'photo':
+                    return self._extract_tiktok_slideshow_info(
+                        video_id,
+                        canonical_url,
+                        audio_only=audio_only,
+                    )
+
+                if not self._should_use_tiktok_embed_fallback(url, original_error):
+                    raise original_error
+
                 embed_url = f'https://www.tiktok.com/embed/v2/{video_id}'
                 metadata = self._get_tiktok_oembed_metadata(canonical_url)
 
@@ -459,6 +737,8 @@ class VideoDownloader:
                 # Continue downloads even if errors occur
                 'ignoreerrors': False,  # Don't ignore errors, but retry instead
                 'no_color': True,  # Disable colored output for cleaner logs
+                # Deno is enabled by default and runs yt-dlp's YouTube EJS challenges.
+                'js_runtimes': {'deno': {}},
             }
 
             if self._is_facebook_url(url):
@@ -541,7 +821,7 @@ class VideoDownloader:
             ydl_opts['progress_hooks'] = [progress_hook]
 
             # Download video
-            info = self._extract_info(url, ydl_opts)
+            info = self._extract_info(url, ydl_opts, audio_only=is_audio_only)
             emit_progress({
                 'state': 'working',
                 'phase': 'processing',
@@ -582,7 +862,12 @@ class VideoDownloader:
             # FORCE re-encode video for Telegram compatibility
             # This ensures Instagram and other videos work correctly on iOS/macOS
             # Also converts non-mp4 formats (webm, mkv) to mp4
-            if not is_audio_only and file_path and os.path.exists(file_path):
+            if (
+                not is_audio_only
+                and file_path
+                and os.path.exists(file_path)
+                and not info.get('_telegram_compatible')
+            ):
                 file_path = self._reencode_video(file_path, video_id)
 
             # Get file size (after re-encoding)

@@ -19,6 +19,9 @@ logging.basicConfig(
     level=getattr(logging, os.getenv('LOG_LEVEL', 'INFO'))
 )
 logger = logging.getLogger(__name__)
+# python-telegram-bot uses token-bearing API URLs internally. Keep them out of logs.
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 # Environment variables
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')

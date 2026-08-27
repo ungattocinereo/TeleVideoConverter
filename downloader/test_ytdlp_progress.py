@@ -11,7 +11,9 @@ class YtDlpProgressTests(unittest.IsolatedAsyncioTestCase):
             downloader = VideoDownloader(storage_path)
             events = []
 
-            def fake_extract_info(url, options):
+            def fake_extract_info(url, options, audio_only=False):
+                self.assertFalse(audio_only)
+                self.assertEqual(options["js_runtimes"], {"deno": {}})
                 progress_hook = options["progress_hooks"][0]
                 progress_hook({
                     "status": "downloading",

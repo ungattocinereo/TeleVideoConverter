@@ -21,6 +21,9 @@ logging.basicConfig(
     level=getattr(logging, os.getenv('LOG_LEVEL', 'INFO'))
 )
 logger = logging.getLogger(__name__)
+# python-telegram-bot uses token-bearing API URLs internally. Keep them out of logs.
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 # Environment variables
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -194,7 +197,12 @@ class DownloadWorker:
 Source: {self._code(stats.get('source_platform', 'Unknown'))}
 Title: {html.escape(stats['title'])}"""
 
-        await self.bot.send_message(chat_id=chat_id, text=message, parse_mode='HTML')
+        await self.bot.send_message(
+            chat_id=chat_id,
+            text=message,
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
 
     async def send_file(self, chat_id: int, file_path: str, thumbnail_path: str = None, width: int = None, height: int = None):
         """Send video/audio file to user with correct dimensions"""

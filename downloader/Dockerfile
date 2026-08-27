@@ -1,10 +1,15 @@
+FROM denoland/deno:bin-2.9.5 AS deno
+
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install ffmpeg, nodejs (JS runtime for yt-dlp extractors), and build dependencies for curl-cffi
+# yt-dlp enables Deno automatically for YouTube's JavaScript challenges.
+COPY --from=deno /deno /usr/local/bin/deno
+
+# Install ffmpeg and build dependencies for curl-cffi.
 RUN apt-get update && \
-    apt-get install -y ffmpeg nodejs gcc libcurl4-openssl-dev libssl-dev && \
+    apt-get install -y ffmpeg gcc libcurl4-openssl-dev libssl-dev && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 

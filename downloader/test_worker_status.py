@@ -56,6 +56,27 @@ class WorkerStatusTests(unittest.IsolatedAsyncioTestCase):
             text="готово",
         )
 
+    async def test_stats_message_disables_link_preview(self):
+        worker = self.make_worker()
+        stats = {
+            "delete_timestamp": 1770000000,
+            "format": "mp4",
+            "codec": "h264",
+            "original_quality": "1280x720 (720p)",
+            "downloaded_quality": "best",
+            "file_size": 1234,
+            "processing_time": 5,
+            "source_platform": "Threads",
+            "title": "https://www.threads.com/@user/post/example",
+        }
+
+        await worker.send_stats_message(42, stats)
+
+        worker.bot.send_message.assert_awaited_once()
+        self.assertTrue(
+            worker.bot.send_message.await_args.kwargs["disable_web_page_preview"],
+        )
+
     def test_real_progress_is_serialized_for_telegram_bot(self):
         worker = self.make_worker()
         task = {"status_key": "download_status:test"}
