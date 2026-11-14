@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -256,6 +257,11 @@ func quipFor(rawURL string) string {
 	return platformQuip(strings.ToLower(u.Hostname()))
 }
 
+func isAPIError(err error) bool {
+	var apiErr *tg.APIError
+	return errors.As(err, &apiErr)
+}
+
 func lower(s string) string { return strings.ToLower(s) }
 
 func contains(s string, subs ...string) bool {
@@ -401,6 +407,9 @@ func (t *Tracker) animate(ctx context.Context, js *jobStatus, joke string) {
 		ectx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		if err := t.tg.EditMessageText(ectx, js.chatID, js.messageID, text, false); err != nil {
 			failures++
+			if !isAPIError(err) {
+				t.tg.ResetConnections()
+			}
 			wait := min(maxEditBackoff, statusPollInterval<<failures)
 			nextEdit = time.Now().Add(wait)
 			slog.Warn("could not refresh Telegram status message", "err", err, "next_try_in", wait)

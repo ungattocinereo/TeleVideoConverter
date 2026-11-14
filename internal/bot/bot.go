@@ -48,6 +48,9 @@ func (b *Bot) Run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
+			if !isAPIError(err) {
+				b.tg.ResetConnections()
+			}
 			slog.Warn("telegram getUpdates failed", "err", err, "retry_in", backoff)
 			select {
 			case <-ctx.Done():

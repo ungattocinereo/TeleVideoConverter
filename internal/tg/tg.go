@@ -199,6 +199,9 @@ func (c *Client) retry(ctx context.Context, op string, fn func() error) error {
 		case errors.As(err, &apiErr):
 			return err
 		default:
+			// Network trouble: drop pooled keep-alive connections so the
+			// retry dials fresh ones instead of reusing a dead socket.
+			c.ResetConnections()
 			delay = min(c.maxDelay, c.baseDelay<<(attempt-1))
 			slog.Warn("telegram request failed", "op", op, "attempt", attempt, "err", err, "retry_in", delay)
 		}
@@ -209,6 +212,13 @@ func (c *Client) retry(ctx context.Context, op string, fn func() error) error {
 		}
 	}
 	return err
+}
+
+// ResetConnections closes idle connections of all three clients.
+func (c *Client) ResetConnections() {
+	for _, hc := range []*http.Client{c.api, c.poll, c.upload} {
+		hc.CloseIdleConnections()
+	}
 }
 
 func jsonBody(params any) body {
