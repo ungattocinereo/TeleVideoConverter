@@ -60,7 +60,7 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 	if queued, err := w.store.QueuedJobs(ctx); err == nil {
 		for _, j := range queued {
-			w.tracker.Start(ctx, j.ID, j.ChatID, j.StatusMessageID, j.CreatedAt, "")
+			w.tracker.Start(ctx, j.ID, j.ChatID, j.StatusMessageID, j.URL, j.CreatedAt, "")
 		}
 	}
 	for {
@@ -94,7 +94,7 @@ func (w *Worker) process(ctx context.Context, job *store.Job) {
 	log := slog.With("job", job.ID, "user", job.UserID)
 	log.Info("processing download", "quality", job.Quality)
 	if w.tracker.get(job.ID) == nil { // web jobs and resumed jobs without a tracker
-		w.tracker.Start(ctx, job.ID, job.ChatID, job.StatusMessageID, job.CreatedAt, "")
+		w.tracker.Start(ctx, job.ID, job.ChatID, job.StatusMessageID, job.URL, job.CreatedAt, "")
 	}
 	start := time.Now()
 	w.tracker.Set(job.ID, "working", nil)
@@ -123,7 +123,7 @@ func (w *Worker) process(ctx context.Context, job *store.Job) {
 	w.tracker.Set(job.ID, "working", &fetch.Progress{Phase: "processing", Percent: &full})
 
 	procStart := time.Now()
-	v, filePath, width, height, duration, err := w.finalize(jctx, res, log)
+	v, filePath, width, height, duration, err := w.finalize(jctx, res, log, func(phase string) { w.tracker.Phase(job.ID, "working", phase) })
 	if ctx.Err() != nil {
 		w.interrupted(job)
 		return
@@ -153,14 +153,15 @@ func (w *Worker) process(ctx context.Context, job *store.Job) {
 		if err := w.sendStats(ctx, job.ChatID, v); err != nil {
 			log.Warn("could not send stats", "err", err)
 		}
-		w.sendFile(ctx, job.ChatID, filePath, deref(v.ThumbnailPath), width, height, duration, res.Audio, v.Title)
+		w.sendFile(ctx, job.ChatID, filePath, deref(v.ThumbnailPath), width, height, duration, res.Audio, v.Title,
+			func(phase string) { w.tracker.Phase(job.ID, "delivering", phase) })
 		if w.wantsDescription(ctx, job.UserID) {
 			w.sendDescription(ctx, job.ChatID, res.Description)
 		}
 		sendSecs := time.Since(sendStart).Seconds()
 		w.store.SetSendSeconds(ctx, v.VideoID, sendSecs)
 		log.Info("delivered", "video", v.VideoID, "send_s", fmt.Sprintf("%.1f", sendSecs))
-		text := fmt.Sprintf("🥟 Пельменный ритуал завершён · %s\n\n%s", formatDuration(processing), terminalJokes.pick("done"))
+		text := fmt.Sprintf("🥟 Пельмени всплыли · %s\n\n%s", ruDuration(processing), jokes.pick("done"))
 		if !w.tracker.Finish(ctx, job.ID, text) && job.StatusMessageID != 0 {
 			w.tg.SendMessage(ctx, job.ChatID, text, tg.SendOpts{})
 		}
@@ -172,7 +173,7 @@ func (w *Worker) process(ctx context.Context, job *store.Job) {
 
 // finalize normalises the downloaded file, makes the thumbnail and builds
 // the database row.
-func (w *Worker) finalize(ctx context.Context, res *fetch.Result, log *slog.Logger) (v *store.Video, path string, width, height int, duration float64, err error) {
+func (w *Worker) finalize(ctx context.Context, res *fetch.Result, log *slog.Logger, phase func(string)) (v *store.Video, path string, width, height int, duration float64, err error) {
 	path = res.FilePath
 	format := strings.TrimPrefix(filepath.Ext(path), ".")
 	if !res.Audio {
@@ -181,16 +182,24 @@ func (w *Worker) finalize(ctx context.Context, res *fetch.Result, log *slog.Logg
 			if p, perr := w.media.Probe(ctx, path); perr == nil {
 				width, height, duration = p.Width, p.Height, p.Duration
 			}
-		} else if nr, nerr := w.media.Normalize(ctx, path, out); nerr == nil {
-			path = nr.Path
-			width, height, duration = nr.Probe.Width, nr.Probe.Height, nr.Probe.Duration
-			log.Info("normalized", "action", nr.Action, "codec", nr.Probe.VideoCodec, "took_s", fmt.Sprintf("%.1f", nr.Elapsed.Seconds()))
 		} else {
-			if ctx.Err() != nil {
-				return nil, "", 0, 0, 0, ctx.Err()
+			// Tell the status message whether we only serve or really cook.
+			if p, perr := w.media.Probe(ctx, path); perr == nil && p.NeedsEncode() {
+				phase("encoding")
+			} else {
+				phase("remuxing")
 			}
-			// Same as before: a failed conversion still delivers the original.
-			log.Warn("normalize failed, keeping original file", "err", nerr)
+			if nr, nerr := w.media.Normalize(ctx, path, out); nerr == nil {
+				path = nr.Path
+				width, height, duration = nr.Probe.Width, nr.Probe.Height, nr.Probe.Duration
+				log.Info("normalized", "action", nr.Action, "codec", nr.Probe.VideoCodec, "took_s", fmt.Sprintf("%.1f", nr.Elapsed.Seconds()))
+			} else {
+				if ctx.Err() != nil {
+					return nil, "", 0, 0, 0, ctx.Err()
+				}
+				// Same as before: a failed conversion still delivers the original.
+				log.Warn("normalize failed, keeping original file", "err", nerr)
+			}
 		}
 		format = strings.TrimPrefix(filepath.Ext(path), ".")
 	}
@@ -249,7 +258,11 @@ func (w *Worker) fail(ctx context.Context, job *store.Job, reason string) {
 	if reason == "" {
 		reason = "Unknown error"
 	}
-	text := fmt.Sprintf("🥟 Пельменный ритуал сорвался\n\n%s\n\nТехническая причина: %s", terminalJokes.pick("error"), truncate(reason, 1200))
+	text := "🥟 Пельменный ритуал сорвался\n\n" + jokes.pick("error") + "\n\n"
+	if q := errorQuip(reason); q != "" {
+		text += q + "\n\n"
+	}
+	text += "Техническая причина: " + truncate(reason, 1200)
 	if !w.tracker.Finish(ctx, job.ID, text) && job.ChatID != 0 {
 		if _, err := w.tg.SendMessage(ctx, job.ChatID, text, tg.SendOpts{}); err != nil {
 			slog.Error("could not report failure", "err", err)
@@ -272,21 +285,22 @@ func (w *Worker) sendStats(ctx context.Context, chat int64, v *store.Video) erro
 	if v.Codec != nil {
 		format += " (" + *v.Codec + ")"
 	}
-	text := fmt.Sprintf(`🥟 Пельменный протокол: файл готов
+	text := fmt.Sprintf(`🥟 Пельменный протокол №%d: видео слеплено
 
-🥖 Original quality: %s
-🥐 Downloaded quality: %s
-🥟 File size: %s
-🥨 Processing time: %s
-🥯 Format: %s
-🥠 Auto-delete: %s
+🥖 Исходник: %s
+🥟 Вес: %s (≈ %s)
+🥨 Лепили: %s
+🥯 Формат: %s
+🫙 Откуда: %s
+🧊 Растает: %s
 
-Source: %s
-Title: %s`,
-		code(derefOr(v.OriginalQuality, "N/A")), code(v.DownloadedQuality), code(formatSize(v.FileSize)),
-		code(formatDuration(v.ProcessingTime)), code(format),
-		code(time.Unix(v.DeleteTimestamp, 0).Format("Jan 02 at 03:04 PM")),
-		code(derefOr(v.SourcePlatform, "Unknown")), html.EscapeString(v.Title))
+📜 %s
+
+<i>%s</i>`,
+		v.DownloadTimestamp%10000, code(derefOr(v.OriginalQuality, "неизвестно")), code(formatSize(v.FileSize)),
+		pelmeni(float64(v.FileSize)), code(ruDuration(v.ProcessingTime)), code(format),
+		code(derefOr(v.SourcePlatform, "неведомые земли")), code(ruDate(v.DeleteTimestamp)),
+		html.EscapeString(v.Title), html.EscapeString(jokes.pick("verdict")))
 	_, err := w.tg.SendMessage(ctx, chat, text, tg.SendOpts{ParseMode: "HTML", DisableWebPagePreview: true})
 	return err
 }
@@ -296,7 +310,7 @@ func (w *Worker) limits() media.Limits {
 		MinVideoKbps: w.cfg.MinVideoKbps, AudioKbps: w.cfg.AudioKbps, Policy: w.cfg.LargeFilePolicy}
 }
 
-func (w *Worker) sendFile(ctx context.Context, chat int64, path, thumb string, width, height int, duration float64, audio bool, title string) {
+func (w *Worker) sendFile(ctx context.Context, chat int64, path, thumb string, width, height int, duration float64, audio bool, title string, phase func(string)) {
 	st, err := os.Stat(path)
 	if err != nil {
 		w.webFallback(ctx, chat, 0, err.Error())
@@ -304,7 +318,7 @@ func (w *Worker) sendFile(ctx context.Context, chat int64, path, thumb string, w
 	}
 	if audio {
 		if st.Size() > w.cfg.SendLimitBytes {
-			w.webFallback(ctx, chat, st.Size(), "Audio file is too large for Telegram Bot API upload")
+			w.webFallback(ctx, chat, st.Size(), "аудиофайл больше лимита Telegram для ботов")
 			return
 		}
 		if err := w.tg.SendAudio(ctx, chat, path, title); err != nil {
@@ -313,7 +327,8 @@ func (w *Worker) sendFile(ctx context.Context, chat int64, path, thumb string, w
 		return
 	}
 	if st.Size() > w.cfg.TargetBytes {
-		w.tg.SendMessage(ctx, chat, fmt.Sprintf("🥧 File is %s. Compressing it for Telegram upload...", formatSize(st.Size())), tg.SendOpts{})
+		phase("compressing")
+		w.tg.SendMessage(ctx, chat, fmt.Sprintf("🥧 Пельмень получился на %s, а в Telegram пролезает только 50 МБ. Ужимаю, не переключайся.", formatSize(st.Size())), tg.SendOpts{})
 	}
 	parts, err := w.media.PrepareForTelegram(ctx, w.limits(), path, filepath.Join(w.cfg.StoragePath, "telegram"))
 	if err != nil {
@@ -321,9 +336,10 @@ func (w *Worker) sendFile(ctx context.Context, chat int64, path, thumb string, w
 		return
 	}
 	defer media.Cleanup(parts)
+	phase("uploading")
 	for _, p := range parts {
 		if p.Count > 1 {
-			w.tg.SendMessage(ctx, chat, fmt.Sprintf("🥟 Sending compressed part %d/%d", p.Index, p.Count), tg.SendOpts{})
+			w.tg.SendMessage(ctx, chat, fmt.Sprintf("🍽 Порция %d из %d. Пельмени делили по-честному.", p.Index, p.Count), tg.SendOpts{})
 		}
 		vp := tg.VideoParams{Width: p.Width, Height: p.Height, Duration: int(p.Duration + 0.5), Thumbnail: thumb}
 		if vp.Width == 0 || vp.Height == 0 {
@@ -333,7 +349,7 @@ func (w *Worker) sendFile(ctx context.Context, chat int64, path, thumb string, w
 			vp.Duration = int(duration + 0.5)
 		}
 		if p.Count > 1 {
-			vp.Caption = fmt.Sprintf("Part %d/%d", p.Index, p.Count)
+			vp.Caption = fmt.Sprintf("🥟 Порция %d/%d", p.Index, p.Count)
 		}
 		if err := w.tg.SendVideo(ctx, chat, p.Path, vp); err != nil {
 			var apiErr *tg.APIError
@@ -349,10 +365,10 @@ func (w *Worker) sendFile(ctx context.Context, chat int64, path, thumb string, w
 
 func (w *Worker) webFallback(ctx context.Context, chat int64, size int64, reason string) {
 	if reason == "" {
-		reason = "Unknown error"
+		reason = "неизвестна даже Министерству"
 	}
 	slog.Warn("sending web fallback", "reason", reason)
-	text := fmt.Sprintf("⚠️ Could not upload file directly to Telegram (%.1f MB).\n\nReason: %s\n\n📥 Download via web interface:\n%s",
+	text := fmt.Sprintf("⚠️ Пельмень (%.1f МБ) застрял в дверях Telegram и не пролез.\n\nПричина: %s\n\n📥 Забрать можно через окошко выдачи:\n%s",
 		float64(size)/(1024*1024), truncate(reason, 1200), w.cfg.WebPublicURL)
 	w.tg.SendMessage(ctx, chat, text, tg.SendOpts{})
 }
@@ -364,7 +380,7 @@ func (w *Worker) sendDescription(ctx context.Context, chat int64, desc string) {
 	if r := []rune(desc); len(r) > 4000 {
 		desc = string(r[:4000]) + "..."
 	}
-	if _, err := w.tg.SendMessage(ctx, chat, "📝 Description:\n\n"+desc, tg.SendOpts{}); err != nil {
+	if _, err := w.tg.SendMessage(ctx, chat, "📝 Начинка поста:\n\n"+desc, tg.SendOpts{}); err != nil {
 		slog.Warn("could not send description", "err", err)
 	}
 }

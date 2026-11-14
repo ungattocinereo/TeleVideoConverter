@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand/v2"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -16,14 +17,20 @@ import (
 
 const (
 	statusPollInterval = 3 * time.Second
-	jokeUpdateInterval = 12 * time.Second
-	progressBarWidth   = 16
+	jokeUpdateInterval = 9 * time.Second
+	barSlots           = 10
+	slowAfter          = 45 * time.Second
+	verySlowAfter      = 3 * time.Minute
+	// One "standard pelmen" of data, per the Ministry of Filling's GOST.
+	pelmenBytes = 256 * 1024
 )
 
 var statusTitles = map[string][2]string{
 	"queued":     {"🥟", "Ссылка в пельменной очереди"},
-	"working":    {"🥟", "Пельмени скачивают и приводят видео в порядок"},
-	"delivering": {"🥐", "Пельменная доставка готовит отправку"},
+	"working":    {"🥟", "Пельмени скачивают видео"},
+	"remuxing":   {"🍽", "Пельмени сервируют видео"},
+	"encoding":   {"🔥", "Пельмени варят видео заново"},
+	"delivering": {"🥐", "Пельменная доставка в пути"},
 }
 
 // messageBag hands out shuffled messages without early repeats.
@@ -40,6 +47,9 @@ func newMessageBag(pools map[string][]string) *messageBag {
 func (b *messageBag) pick(kind string) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if len(b.pools[kind]) == 0 {
+		kind = "working"
+	}
 	if len(b.bags[kind]) == 0 {
 		bag := append([]string(nil), b.pools[kind]...)
 		rand.Shuffle(len(bag), func(i, j int) { bag[i], bag[j] = bag[j], bag[i] })
@@ -51,12 +61,42 @@ func (b *messageBag) pick(kind string) string {
 	return msg
 }
 
-var (
-	statusJokes = newMessageBag(map[string][]string{
-		"queued": queuedMessages, "working": workingMessages, "delivering": deliveringMessages,
-	})
-	terminalJokes = newMessageBag(map[string][]string{"done": successMessages, "error": errorMessages})
-)
+var jokes = newMessageBag(jokePools)
+
+// jokeKind picks the pool for the current moment. Download phases mix their
+// own jokes with the general ones, and long downloads get increasingly
+// unhinged.
+func jokeKind(state string, p *fetch.Progress, elapsed time.Duration) string {
+	phase := ""
+	if p != nil {
+		phase = p.Phase
+	}
+	switch state {
+	case "queued":
+		return "queued"
+	case "delivering":
+		if phase == "compressing" {
+			return "compressing"
+		}
+		return "delivering"
+	}
+	switch phase {
+	case "remuxing":
+		return "remux"
+	case "encoding":
+		return "encoding"
+	}
+	r := rand.Float64()
+	switch {
+	case elapsed > verySlowAfter && r < 0.5:
+		return "veryslow"
+	case elapsed > slowAfter && r < 0.4:
+		return "slow"
+	case (phase == "video" || phase == "audio") && r < 0.6:
+		return phase
+	}
+	return "working"
+}
 
 func formatElapsed(d time.Duration) string {
 	total := max(0, int(d.Seconds()))
@@ -77,36 +117,76 @@ func formatProgressSize(v float64) string {
 	return fmt.Sprintf("%.1f GB", v)
 }
 
+// plural picks the Russian word form for n (1 пельмень, 2 пельменя, 5 пельменей).
+func plural(n int64, one, few, many string) string {
+	n = max(n, -n) % 100
+	switch {
+	case n >= 11 && n <= 14:
+		return many
+	case n%10 == 1:
+		return one
+	case n%10 >= 2 && n%10 <= 4:
+		return few
+	}
+	return many
+}
+
+func pelmeni(bytes float64) string {
+	n := int64(math.Round(bytes / pelmenBytes))
+	return fmt.Sprintf("%d %s", n, plural(n, "пельмень", "пельменя", "пельменей"))
+}
+
+// progressBar draws dumplings for known progress, or one dumpling bobbing in
+// the broth when the total size is unknown.
 func progressBar(percent *float64, elapsed time.Duration) string {
 	if percent != nil {
 		p := math.Max(0, math.Min(100, *percent))
-		filled := int(math.RoundToEven(progressBarWidth * p / 100))
-		return fmt.Sprintf("[%s%s] %5.1f%%", strings.Repeat("█", filled), strings.Repeat("░", progressBarWidth-filled), p)
+		filled := int(math.RoundToEven(barSlots * p / 100))
+		return fmt.Sprintf("%s%s %5.1f%%", strings.Repeat("🥟", filled), strings.Repeat("◦", barSlots-filled), p)
 	}
-	const pulse = 3
-	travel := progressBarWidth - pulse
-	step := int(elapsed / statusPollInterval)
-	pos := step % (travel * 2)
-	start := pos
+	travel := barSlots - 1
+	pos := int(elapsed/statusPollInterval) % (travel * 2)
 	if pos > travel {
-		start = travel*2 - pos
+		pos = travel*2 - pos
 	}
-	return "[" + strings.Repeat("░", start) + strings.Repeat("▓", pulse) + strings.Repeat("░", progressBarWidth-start-pulse) + "]"
+	return strings.Repeat("〰", pos) + "🥟" + strings.Repeat("〰", travel-pos)
+}
+
+// broth turns progress into a broth temperature: boiling at 100%.
+func broth(percent float64) string {
+	t := int(20 + 0.8*math.Max(0, math.Min(100, percent)))
+	switch {
+	case t >= 100:
+		return "🌡 бульон кипит, пельмени всплывают"
+	case t >= 80:
+		return fmt.Sprintf("🌡 бульон %d °C, пельмени волнуются", t)
+	case t >= 50:
+		return fmt.Sprintf("🌡 бульон %d °C, пахнет надеждой", t)
+	}
+	return fmt.Sprintf("🌡 бульон %d °C, пельмени ждут", t)
 }
 
 func progressDetails(state string, elapsed time.Duration, p *fetch.Progress) string {
 	full := 100.0
+	if p == nil {
+		p = &fetch.Progress{}
+	}
 	switch state {
 	case "queued":
 		return progressBar(nil, elapsed) + "\n🥨 Кастрюля ищет свободную конфорку"
 	case "delivering":
-		return progressBar(&full, elapsed) + "\n🥐 Скачивание завершено · пельмени несут файл в Telegram"
+		if p.Phase == "compressing" {
+			return progressBar(nil, elapsed) + "\n🗜 Ужимаю под лимит Telegram в 50 МБ"
+		}
+		return progressBar(&full, elapsed) + "\n🥐 Пельмени несут файл в Telegram"
 	}
-	if p == nil {
-		p = &fetch.Progress{}
-	}
-	if p.Phase == "processing" {
-		return progressBar(&full, elapsed) + "\n🥧 Скачивание завершено · перекодирую и проверяю начинку"
+	switch p.Phase {
+	case "processing":
+		return progressBar(&full, elapsed) + "\n🥧 Скачано · пельмени осматривают начинку"
+	case "remuxing":
+		return progressBar(&full, elapsed) + "\n🍽 Скачано · видео уже годное, перекладываю в тарелку"
+	case "encoding":
+		return progressBar(nil, elapsed) + "\n🔥 Скачано · формат упрямый, варю в H.264"
 	}
 	lines := []string{progressBar(p.Percent, elapsed)}
 	switch p.Phase {
@@ -115,9 +195,9 @@ func progressDetails(state string, elapsed time.Duration, p *fetch.Progress) str
 	case "audio":
 		lines = append(lines, "🥨 Качаю аудиослой")
 	case "media":
-		lines = append(lines, "🥖 Качаю файл")
+		lines = append(lines, "🥖 Качаю файл целиком")
 	default:
-		lines = append(lines, "🥯 Качаю то, что удалось поймать шумовкой")
+		lines = append(lines, "🥯 Ловлю шумовкой всё, что плавает")
 	}
 	var metrics []string
 	if p.Downloaded != nil {
@@ -125,26 +205,61 @@ func progressDetails(state string, elapsed time.Duration, p *fetch.Progress) str
 		if p.Total != nil && *p.Total > 0 {
 			amount += " / " + formatProgressSize(float64(*p.Total))
 		}
-		metrics = append(metrics, amount)
+		metrics = append(metrics, "📦 "+amount+" (≈ "+pelmeni(float64(*p.Downloaded))+")")
 	}
 	if p.Speed != nil && *p.Speed > 0 {
-		metrics = append(metrics, formatProgressSize(*p.Speed)+"/s")
+		metrics = append(metrics, "🚀 "+formatProgressSize(*p.Speed)+"/s")
 	}
 	if p.ETA != nil {
-		metrics = append(metrics, "ещё ≈ "+formatElapsed(time.Duration(*p.ETA)*time.Second))
+		metrics = append(metrics, "⏳ ещё ≈ "+formatElapsed(time.Duration(*p.ETA)*time.Second))
 	}
 	if len(metrics) > 0 {
 		lines = append(lines, strings.Join(metrics, " · "))
 	}
+	if p.Percent != nil {
+		lines = append(lines, broth(*p.Percent))
+	}
 	return strings.Join(lines, "\n")
 }
 
-func statusMessage(state string, elapsed time.Duration, p *fetch.Progress, joke string) string {
-	t, ok := statusTitles[state]
-	if !ok {
-		t = statusTitles["working"]
+func titleFor(state string, p *fetch.Progress) [2]string {
+	if state == "working" && p != nil {
+		if t, ok := statusTitles[p.Phase]; ok {
+			return t
+		}
 	}
-	return fmt.Sprintf("%s %s · %s\n%s\n\n%s", t[0], t[1], formatElapsed(elapsed), progressDetails(state, elapsed, p), joke)
+	if t, ok := statusTitles[state]; ok {
+		return t
+	}
+	return statusTitles["working"]
+}
+
+func statusMessage(state string, elapsed time.Duration, p *fetch.Progress, quip, joke string) string {
+	t := titleFor(state, p)
+	head := fmt.Sprintf("%s %s · %s", t[0], t[1], formatElapsed(elapsed))
+	if quip != "" {
+		head += "\n" + quip
+	}
+	return fmt.Sprintf("%s\n\n%s\n\n%s", head, progressDetails(state, elapsed, p), joke)
+}
+
+func quipFor(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return platformQuip(strings.ToLower(u.Hostname()))
+}
+
+func lower(s string) string { return strings.ToLower(s) }
+
+func contains(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // -------------------------------------------------------------- tracker ---
@@ -161,6 +276,7 @@ type jobStatus struct {
 	started   time.Time
 	chatID    int64
 	messageID int64
+	quip      string
 }
 
 type Tracker struct {
@@ -174,8 +290,9 @@ func NewTracker(c *tg.Client) *Tracker {
 }
 
 // Start begins animating a job's status message (if it has one).
-func (t *Tracker) Start(ctx context.Context, jobID, chatID, messageID int64, started time.Time, firstJoke string) {
-	js := &jobStatus{state: "queued", started: started, chatID: chatID, messageID: messageID, stopped: make(chan struct{})}
+func (t *Tracker) Start(ctx context.Context, jobID, chatID, messageID int64, rawURL string, started time.Time, firstJoke string) {
+	js := &jobStatus{state: "queued", started: started, chatID: chatID, messageID: messageID,
+		quip: quipFor(rawURL), stopped: make(chan struct{})}
 	t.mu.Lock()
 	t.jobs[jobID] = js
 	t.mu.Unlock()
@@ -192,13 +309,18 @@ func (t *Tracker) get(jobID int64) *jobStatus {
 	return t.jobs[jobID]
 }
 
-// Set publishes a non-terminal state and optional download progress.
+// Set publishes a non-terminal state and optional progress/phase.
 func (t *Tracker) Set(jobID int64, state string, p *fetch.Progress) {
 	if js := t.get(jobID); js != nil {
 		js.mu.Lock()
 		js.state, js.progress = state, p
 		js.mu.Unlock()
 	}
+}
+
+// Phase changes only the phase, keeping the current state.
+func (t *Tracker) Phase(jobID int64, state, phase string) {
+	t.Set(jobID, state, &fetch.Progress{Phase: phase})
 }
 
 // Finish stops the animation and replaces the status message with text.
@@ -236,9 +358,9 @@ func (t *Tracker) Drop(jobID int64) {
 func (t *Tracker) animate(ctx context.Context, js *jobStatus, joke string) {
 	defer close(js.stopped)
 	if joke == "" {
-		joke = statusJokes.pick("queued")
+		joke = jokes.pick("queued")
 	}
-	jokeState, lastJoke := "queued", time.Now()
+	moment, lastJoke := "queued", time.Now()
 	tick := time.NewTicker(statusPollInterval)
 	defer tick.Stop()
 	for {
@@ -252,14 +374,15 @@ func (t *Tracker) animate(ctx context.Context, js *jobStatus, joke string) {
 			js.mu.Unlock()
 			return
 		}
-		state := js.state
-		if _, ok := statusTitles[state]; !ok {
-			state = "working"
+		elapsed := time.Since(js.started)
+		now := js.state
+		if js.progress != nil {
+			now += "/" + js.progress.Phase
 		}
-		if state != jokeState || time.Since(lastJoke) >= jokeUpdateInterval {
-			joke, jokeState, lastJoke = statusJokes.pick(state), state, time.Now()
+		if now != moment || time.Since(lastJoke) >= jokeUpdateInterval {
+			joke, moment, lastJoke = jokes.pick(jokeKind(js.state, js.progress, elapsed)), now, time.Now()
 		}
-		text := statusMessage(state, time.Since(js.started), js.progress, joke)
+		text := statusMessage(js.state, elapsed, js.progress, js.quip, joke)
 		ectx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		if err := t.tg.EditMessageText(ectx, js.chatID, js.messageID, text, false); err != nil {
 			slog.Warn("could not refresh Telegram status message", "err", err)

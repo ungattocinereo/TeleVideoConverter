@@ -97,6 +97,8 @@ func (b *Bot) handle(ctx context.Context, m *tg.Message) {
 			b.stats(ctx, m)
 		case "description":
 			b.toggleDescription(ctx, m)
+		case "pelmen", "pelmeni", "fact":
+			b.reply(ctx, m, "🥟 "+jokes.pick("facts"))
 		}
 		return
 	}
@@ -109,20 +111,20 @@ func (b *Bot) handle(ctx context.Context, m *tg.Message) {
 	}
 }
 
-const welcome = `
-🎬 Welcome to TeleVideo Converter Bot!
+const welcome = `🥟 Добро пожаловать в Пельменную!
 
-Send me a video URL and I'll download it for you.
+Здесь видео не скачивают — здесь его лепят, варят и подают горячим.
+Кидай ссылку из YouTube, TikTok, Instagram, X, Threads, Reddit, Vimeo
+и ещё тысячи мест — пельмени разберутся. Почти всегда.
 
-📝 Commands:
-/start - Show this message
-/list - Show all saved videos
-/search <keyword> - Search videos
-/stats - Show usage statistics
-/description - Toggle post description
+📜 Меню:
+/list — что лежит в морозилке
+/search слово — найти пельмень по названию
+/stats — пельменная статистика
+/description — подавать ли описание поста (сейчас: решают пельмени)
+/pelmen — случайный пельменный факт
 
-Supported platforms: YouTube, Vimeo, and many more!
-`
+Видео хранятся несколько дней, потом тают. Это не баг, это свежесть.`
 
 func (b *Bot) rateLimited(user int64) bool {
 	b.rateMu.Lock()
@@ -150,24 +152,24 @@ func validURL(s string) bool {
 func (b *Bot) handleURL(ctx context.Context, m *tg.Message, link string) {
 	slog.Info("received link", "user", m.From.ID)
 	if !validURL(link) {
-		b.reply(ctx, m, "❌ Invalid URL")
+		b.reply(ctx, m, "❌ Это не ссылка, это сырое тесто. Пришли нормальный адрес, начинающийся с http.")
 		return
 	}
 	if b.rateLimited(m.From.ID) {
-		b.reply(ctx, m, fmt.Sprintf("⚠️ Rate limit exceeded. Maximum %d downloads per hour.", b.cfg.MaxDownloadsPerHour))
+		b.reply(ctx, m, fmt.Sprintf("♨️ Кастрюля перегрелась: не больше %d ссылок в час. Пельмени ушли на перекур, скоро вернутся.", b.cfg.MaxDownloadsPerHour))
 		return
 	}
 	if st, err := b.store.GetStats(ctx, m.From.ID); err == nil && float64(st.UsedSpaceBytes)/(1<<30) >= b.cfg.MaxStorageGB {
-		b.reply(ctx, m, fmt.Sprintf("❌ Storage limit reached (%sGB). Please wait for old files to be deleted.", pyFloat(b.cfg.MaxStorageGB)))
+		b.reply(ctx, m, fmt.Sprintf("🧊 Морозилка забита под завязку (%s ГБ). Подожди, пока старые пельмени растают.", pyFloat(b.cfg.MaxStorageGB)))
 		return
 	}
 
 	// One status message is edited throughout the download. If Telegram is
 	// down we still queue the link.
 	started := time.Now()
-	joke := statusJokes.pick("queued")
+	joke := jokes.pick("queued")
 	var statusID int64
-	if sm, err := b.tg.SendMessage(ctx, m.Chat.ID, statusMessage("queued", 0, nil, joke), tg.SendOpts{}); err == nil {
+	if sm, err := b.tg.SendMessage(ctx, m.Chat.ID, statusMessage("queued", 0, nil, quipFor(link), joke), tg.SendOpts{}); err == nil {
 		statusID = sm.MessageID
 	} else {
 		slog.Error("could not send queued status; queueing download without it", "err", err)
@@ -181,16 +183,17 @@ func (b *Bot) handleURL(ctx context.Context, m *tg.Message, link string) {
 		}
 		return
 	}
-	b.tracker.Start(ctx, job.ID, job.ChatID, statusID, started, joke)
+	b.tracker.Start(ctx, job.ID, job.ChatID, statusID, link, started, joke)
 	b.worker.Wake()
 	slog.Info("queued download", "job", job.ID, "user", m.From.ID)
 }
 
 func remaining(deleteAt int64) string {
-	secs := float64(deleteAt - time.Now().Unix())
-	h := int(math.Floor(secs / 3600))
-	mins := int(math.Floor(math.Mod(math.Mod(secs, 3600)+3600, 3600) / 60))
-	return fmt.Sprintf("%dh %dm", h, mins)
+	secs := deleteAt - time.Now().Unix()
+	if secs <= 0 {
+		return "вот-вот растает"
+	}
+	return "растает через " + ruDuration(secs)
 }
 
 func (b *Bot) list(ctx context.Context, m *tg.Message) {
@@ -200,21 +203,21 @@ func (b *Bot) list(ctx context.Context, m *tg.Message) {
 		return
 	}
 	if len(vs) == 0 {
-		b.reply(ctx, m, "📁 No videos found")
+		b.reply(ctx, m, "🧊 Морозилка пуста. Пельмени скучают и смотрят на дверь.")
 		return
 	}
 	var sb strings.Builder
-	sb.WriteString("📁 Your videos:\n\n")
+	fmt.Fprintf(&sb, "🧊 В морозилке %d %s:\n\n", len(vs), plural(int64(len(vs)), "видео", "видео", "видео"))
 	for _, v := range vs {
-		fmt.Fprintf(&sb, "📹 %s\n📦 %s\n🗑 Deletes in: %s\n📅 %s\n\n", runes(v.Title, 50), formatSize(v.FileSize),
-			remaining(v.DeleteTimestamp), time.Unix(v.DownloadTimestamp, 0).Format("Jan 02, 03:04 PM"))
+		fmt.Fprintf(&sb, "📹 %s\n📦 %s (≈ %s) · 🗑 %s\n📅 %s\n\n", runes(v.Title, 50), formatSize(v.FileSize),
+			pelmeni(float64(v.FileSize)), remaining(v.DeleteTimestamp), ruDate(v.DownloadTimestamp))
 	}
 	b.sendLong(ctx, m, sb.String())
 }
 
 func (b *Bot) search(ctx context.Context, m *tg.Message, args []string) {
 	if len(args) == 0 {
-		b.reply(ctx, m, "❌ Please provide a search keyword\nUsage: /search <keyword>")
+		b.reply(ctx, m, "🔍 Что ищем? Напиши так: /search котики")
 		return
 	}
 	kw := strings.Join(args, " ")
@@ -224,13 +227,13 @@ func (b *Bot) search(ctx context.Context, m *tg.Message, args []string) {
 		return
 	}
 	if len(vs) == 0 {
-		b.reply(ctx, m, "🔍 No videos found for: "+kw)
+		b.reply(ctx, m, "🔦 Пельмени перерыли всю морозилку — ничего про «"+kw+"». Только лёд и одинокий вареник.")
 		return
 	}
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "🔍 Search results for '%s':\n\n", kw)
+	fmt.Fprintf(&sb, "🔍 Нашлось по запросу «%s»:\n\n", kw)
 	for _, v := range vs {
-		fmt.Fprintf(&sb, "📹 %s\n📦 %s\n🗑 Deletes in: %s\n\n", runes(v.Title, 50), formatSize(v.FileSize), remaining(v.DeleteTimestamp))
+		fmt.Fprintf(&sb, "📹 %s\n📦 %s · 🗑 %s\n\n", runes(v.Title, 50), formatSize(v.FileSize), remaining(v.DeleteTimestamp))
 	}
 	b.sendLong(ctx, m, sb.String())
 }
@@ -257,15 +260,23 @@ func (b *Bot) stats(ctx context.Context, m *tg.Message) {
 		return
 	}
 	used := float64(st.UsedSpaceBytes) / (1 << 30)
-	b.reply(ctx, m, fmt.Sprintf(`
-📊 Usage Statistics
+	verdict := "Пельмени довольны и слегка округлились."
+	switch {
+	case st.Downloads7d == 0:
+		verdict = "За неделю ни одной ссылки. Пельмени начинают подозревать, что ты ходишь в другую пельменную."
+	case st.Downloads7d >= 20:
+		verdict = "Ты кормишь пельменей лучше, чем родная бабушка. Министерство Начинки впечатлено."
+	}
+	b.reply(ctx, m, fmt.Sprintf(`📊 Пельменная статистика
 
-💾 Storage: %.2f GB / %s GB
-📁 Free space: %.2f GB
-📹 Total videos: %d
-⬇️ Downloads (7 days): %d
-⬇️ Downloads (30 days): %d
-`, used, pyFloat(b.cfg.MaxStorageGB), b.cfg.MaxStorageGB-used, st.TotalVideos, st.Downloads7d, st.Downloads30d))
+🧊 В морозилке: %.2f из %s ГБ (≈ %s)
+🕳 Свободно: %.2f ГБ
+📹 Видео сейчас: %d
+🥟 Слеплено за 7 дней: %d
+🥟 Слеплено за 30 дней: %d
+
+%s`, used, pyFloat(b.cfg.MaxStorageGB), pelmeni(float64(st.UsedSpaceBytes)), b.cfg.MaxStorageGB-used,
+		st.TotalVideos, st.Downloads7d, st.Downloads30d, verdict))
 }
 
 func (b *Bot) toggleDescription(ctx context.Context, m *tg.Message) {
@@ -275,17 +286,17 @@ func (b *Bot) toggleDescription(ctx context.Context, m *tg.Message) {
 		return
 	}
 	if !ok {
-		cur = true
+		cur = b.cfg.SendDescription
 	}
 	if err := b.store.SetSendDescription(ctx, m.From.ID, !cur); err != nil {
 		slog.Error("set setting", "err", err)
 		return
 	}
-	status := "enabled ✅"
 	if cur {
-		status = "disabled ❌"
+		b.reply(ctx, m, "🤐 Описание постов выключено ❌ Пельмени дали обет молчания и подают видео без лишних слов.")
+		return
 	}
-	b.reply(ctx, m, "📝 Post description is now "+status)
+	b.reply(ctx, m, "📝 Описание постов включено ✅ Пельмени будут зачитывать подписи вслух, с выражением.")
 }
 
 // ------------------------------------------------------------- formatting ---
@@ -301,14 +312,28 @@ func formatSize(n int64) string {
 	return fmt.Sprintf("%.1f TB", v)
 }
 
-func formatDuration(secs int64) string {
+// ruDuration prints 7 с, 1 мин 15 с, 2 ч 3 мин.
+func ruDuration(secs int64) string {
 	switch {
 	case secs < 60:
-		return fmt.Sprintf("%ds", secs)
+		return fmt.Sprintf("%d с", secs)
 	case secs < 3600:
-		return fmt.Sprintf("%dm %ds", secs/60, secs%60)
+		if secs%60 == 0 {
+			return fmt.Sprintf("%d мин", secs/60)
+		}
+		return fmt.Sprintf("%d мин %d с", secs/60, secs%60)
+	case secs < 86400:
+		return fmt.Sprintf("%d ч %d мин", secs/3600, secs%3600/60)
 	}
-	return fmt.Sprintf("%dh %dm", secs/3600, secs%3600/60)
+	return fmt.Sprintf("%d д %d ч", secs/86400, secs%86400/3600)
+}
+
+var ruMonths = [...]string{"янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"}
+
+// ruDate prints 17 ноя, 21:31 in the container's local time.
+func ruDate(unix int64) string {
+	t := time.Unix(unix, 0)
+	return fmt.Sprintf("%d %s, %s", t.Day(), ruMonths[t.Month()-1], t.Format("15:04"))
 }
 
 // pyFloat prints a float the way Python's str() does for simple values (5.0).
