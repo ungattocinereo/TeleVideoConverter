@@ -150,7 +150,7 @@ func (w *Worker) process(ctx context.Context, job *store.Job) {
 	if job.ChatID != 0 {
 		sendStart := time.Now()
 		w.tracker.Set(job.ID, "delivering", nil)
-		if err := w.sendStats(ctx, job.ChatID, v); err != nil {
+		if err := w.sendStats(ctx, job.ChatID, v, duration); err != nil {
 			log.Warn("could not send stats", "err", err)
 		}
 		statsDone := time.Now()
@@ -244,7 +244,7 @@ func (w *Worker) finalize(ctx context.Context, res *fetch.Result, log *slog.Logg
 		}
 		v.Codec = &codec
 		if res.Width > 0 && res.Height > 0 {
-			q := fmt.Sprintf("%dx%d (%dp)", res.Width, res.Height, res.Height)
+			q := fmt.Sprintf("%dx%d (%dp)", res.Width, res.Height, min(res.Width, res.Height))
 			v.OriginalQuality = &q
 		}
 		thumbs := filepath.Join(w.cfg.StoragePath, "thumbnails")
@@ -299,27 +299,35 @@ func (w *Worker) wantsDescription(ctx context.Context, user int64) bool {
 
 func code(v string) string { return "<code>" + html.EscapeString(v) + "</code>" }
 
-func (w *Worker) sendStats(ctx context.Context, chat int64, v *store.Video) error {
-	format := v.Format
-	if v.Codec != nil {
-		format += " (" + *v.Codec + ")"
+var platformNames = map[string]string{
+	"Twitter": "X", "Youtube": "YouTube", "TikTok": "TikTok", "Instagram": "Instagram", "Threads": "Threads",
+	"Reddit": "Reddit", "Facebook": "Facebook", "Vimeo": "Vimeo", "Twitch": "Twitch", "VK": "VK",
+}
+
+// sendStats posts the short card that precedes the video: facts only,
+// no jokes (those live in the status message).
+func (w *Worker) sendStats(ctx context.Context, chat int64, v *store.Video, duration float64) error {
+	source := derefOr(v.SourcePlatform, "")
+	if name, ok := platformNames[source]; ok {
+		source = name
 	}
-	text := fmt.Sprintf(`🥟 Пельменный протокол №%d: видео слеплено
-
-🥖 Исходник: %s
-🥟 Вес: %s (≈ %s)
-🥨 Лепили: %s
-🥯 Формат: %s
-🫙 Откуда: %s
-🧊 Растает: %s
-
-📜 %s
-
-<i>%s</i>`,
-		v.DownloadTimestamp%10000, code(derefOr(v.OriginalQuality, "неизвестно")), code(formatSize(v.FileSize)),
-		pelmeni(float64(v.FileSize)), code(ruDuration(v.ProcessingTime)), code(format),
-		code(derefOr(v.SourcePlatform, "неведомые земли")), code(ruDate(v.DeleteTimestamp)),
-		html.EscapeString(v.Title), html.EscapeString(jokes.pick("verdict")))
+	head := "🥟 <b>Готово за " + ruDuration(v.ProcessingTime) + "</b>"
+	if source != "" && source != "Generic" && source != "Unknown" {
+		head += " · " + html.EscapeString(source)
+	}
+	var facts []string
+	if duration > 0 {
+		facts = append(facts, "🎞 "+formatElapsed(time.Duration(duration*float64(time.Second))))
+	}
+	if q := derefOr(v.OriginalQuality, ""); q != "" {
+		res, _, _ := strings.Cut(q, " ")
+		facts = append(facts, "📐 "+strings.Replace(res, "x", "×", 1))
+	}
+	facts = append(facts, "💾 "+formatSize(v.FileSize))
+	text := head + "\n" + strings.Join(facts, " · ") + "\n🧊 хранится до " + ruDate(v.DeleteTimestamp)
+	if v.Title != "" && v.Title != v.VideoID {
+		text += "\n\n<i>" + html.EscapeString(runes(strings.TrimSpace(v.Title), 200)) + "</i>"
+	}
 	_, err := w.tg.SendMessage(ctx, chat, text, tg.SendOpts{ParseMode: "HTML", DisableWebPagePreview: true})
 	return err
 }
@@ -359,7 +367,7 @@ func (w *Worker) sendFile(ctx context.Context, chat int64, videoID, cachedFileID
 	}
 	if st.Size() > w.cfg.TargetBytes {
 		phase("compressing")
-		w.tg.SendMessage(ctx, chat, fmt.Sprintf("🥧 Пельмень получился на %s, а в Telegram пролезает только 50 МБ. Ужимаю, не переключайся.", formatSize(st.Size())), tg.SendOpts{})
+		w.tg.SendMessage(ctx, chat, fmt.Sprintf("🗜 %s → ужимаю под лимит Telegram (%s)", formatSize(st.Size()), formatSize(w.cfg.SendLimitBytes)), tg.SendOpts{})
 	}
 	parts, err := w.media.PrepareForTelegram(ctx, w.limits(), path, filepath.Join(w.cfg.StoragePath, "telegram"))
 	if err != nil {
@@ -369,9 +377,6 @@ func (w *Worker) sendFile(ctx context.Context, chat int64, videoID, cachedFileID
 	defer media.Cleanup(parts)
 	phase("uploading")
 	for _, p := range parts {
-		if p.Count > 1 {
-			w.tg.SendMessage(ctx, chat, fmt.Sprintf("🍽 Порция %d из %d. Пельмени делили по-честному.", p.Index, p.Count), tg.SendOpts{})
-		}
 		vp := tg.VideoParams{Width: p.Width, Height: p.Height, Duration: int(p.Duration + 0.5), Thumbnail: thumb}
 		if vp.Width == 0 || vp.Height == 0 {
 			vp.Width, vp.Height = width, height
@@ -380,7 +385,7 @@ func (w *Worker) sendFile(ctx context.Context, chat int64, videoID, cachedFileID
 			vp.Duration = int(duration + 0.5)
 		}
 		if p.Count > 1 {
-			vp.Caption = fmt.Sprintf("🥟 Порция %d/%d", p.Index, p.Count)
+			vp.Caption = fmt.Sprintf("🎞 Часть %d/%d", p.Index, p.Count)
 		}
 		fileID, err := w.tg.SendVideo(ctx, chat, p.Path, vp)
 		if err != nil {
@@ -404,10 +409,10 @@ func (w *Worker) sendFile(ctx context.Context, chat int64, videoID, cachedFileID
 
 func (w *Worker) webFallback(ctx context.Context, chat int64, size int64, reason string) {
 	if reason == "" {
-		reason = "неизвестна даже Министерству"
+		reason = "причина неизвестна"
 	}
 	slog.Warn("sending web fallback", "reason", reason)
-	text := fmt.Sprintf("⚠️ Пельмень (%.1f МБ) застрял в дверях Telegram и не пролез.\n\nПричина: %s\n\n📥 Забрать можно через окошко выдачи:\n%s",
+	text := fmt.Sprintf("⚠️ Не отправилось в Telegram (%.1f MB)\n%s\n📥 Скачать: %s",
 		float64(size)/(1024*1024), truncate(reason, 1200), w.cfg.WebPublicURL)
 	w.tg.SendMessage(ctx, chat, text, tg.SendOpts{})
 }
