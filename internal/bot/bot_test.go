@@ -42,20 +42,21 @@ func TestNoRepeatsBeforeExhausted(t *testing.T) {
 }
 
 func TestJokeKind(t *testing.T) {
-	if k := jokeKind("queued", nil, 0); k != "queued" {
+	if k := jokeKind("queued", nil, 0, 0); k != "queued" {
 		t.Error(k)
 	}
-	if k := jokeKind("working", &fetch.Progress{Phase: "encoding"}, time.Hour); k != "encoding" {
+	if k := jokeKind("working", &fetch.Progress{Phase: "encoding"}, time.Hour, 0); k != "encoding" {
 		t.Error(k)
 	}
-	if k := jokeKind("delivering", &fetch.Progress{Phase: "compressing"}, 0); k != "compressing" {
+	if k := jokeKind("delivering", &fetch.Progress{Phase: "compressing"}, 0, time.Minute); k != "compressing" {
 		t.Error(k)
 	}
 	kinds := map[string]bool{}
 	for range 500 {
-		kinds[jokeKind("working", &fetch.Progress{Phase: "video"}, 5*time.Minute)] = true
+		kinds[jokeKind("working", &fetch.Progress{Phase: "video"}, 5*time.Minute, 0)] = true
+		kinds[jokeKind("delivering", nil, 5*time.Minute, time.Minute)] = true
 	}
-	for _, want := range []string{"veryslow", "video", "working"} {
+	for _, want := range []string{"veryslow", "video", "working", "tgslow", "delivering"} {
 		if !kinds[want] {
 			t.Errorf("long video download never picked %q (%v)", want, kinds)
 		}

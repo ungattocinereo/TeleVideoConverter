@@ -158,6 +158,17 @@ var deliveringExtra = []string{
 	"Пельменный дрон взлетел. Дрон — это пельмень, которого очень сильно подбросили.",
 }
 
+var telegramSlowMessages = []string{
+	"Telegram жуёт файл. Пельмени вежливо ждут у окошка выдачи.",
+	"Серверы Telegram задумались. Пельмени стучат по стойке и смотрят на часы.",
+	"Посылку приняли, но Telegram долго её разглядывает. Видимо, таких пельменей он ещё не видел.",
+	"Telegram подвис. Это не мы, честно: пельмени показали чек и запись с камеры.",
+	"Курьер-пельмень застрял в пробке на въезде в Telegram. Сигналит.",
+	"Telegram отвечает медленно. Пельмени не сдаются и пробуют ещё раз — они упрямые.",
+	"В Telegram очередь, как в паспортном столе. Пельмени взяли номерок и термос.",
+	"Похоже, Telegram сейчас тормозит у всех. Пельмени держат файл тёплым.",
+}
+
 var successExtra = []string{
 	"Пельмени всплыли! Верный знак, что видео готово.",
 	"Готово. Подавать горячим, смотреть со сметаной.",
@@ -229,6 +240,7 @@ var jokePools = map[string][]string{
 	"encoding":    encodingMessages,
 	"compressing": compressingMessages,
 	"delivering":  join(deliveringMessages, deliveringExtra),
+	"tgslow":      telegramSlowMessages,
 	"done":        join(successMessages, successExtra),
 	"error":       join(errorMessages, errorExtra),
 	"facts":       pelmeniFacts,

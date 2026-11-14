@@ -21,6 +21,8 @@ const (
 	barSlots           = 10
 	slowAfter          = 45 * time.Second
 	verySlowAfter      = 3 * time.Minute
+	telegramSlowAfter  = 20 * time.Second
+	maxEditBackoff     = time.Minute
 	// One "standard pelmen" of data, per the Ministry of Filling's GOST.
 	pelmenBytes = 256 * 1024
 )
@@ -66,7 +68,7 @@ var jokes = newMessageBag(jokePools)
 // jokeKind picks the pool for the current moment. Download phases mix their
 // own jokes with the general ones, and long downloads get increasingly
 // unhinged.
-func jokeKind(state string, p *fetch.Progress, elapsed time.Duration) string {
+func jokeKind(state string, p *fetch.Progress, elapsed, inState time.Duration) string {
 	phase := ""
 	if p != nil {
 		phase = p.Phase
@@ -77,6 +79,9 @@ func jokeKind(state string, p *fetch.Progress, elapsed time.Duration) string {
 	case "delivering":
 		if phase == "compressing" {
 			return "compressing"
+		}
+		if inState > telegramSlowAfter && rand.Float64() < 0.6 {
+			return "tgslow"
 		}
 		return "delivering"
 	}
@@ -270,6 +275,7 @@ func contains(s string, subs ...string) bool {
 type jobStatus struct {
 	mu        sync.Mutex
 	state     string
+	since     time.Time // when state last changed
 	progress  *fetch.Progress
 	terminal  bool
 	stopped   chan struct{}
@@ -291,7 +297,7 @@ func NewTracker(c *tg.Client) *Tracker {
 
 // Start begins animating a job's status message (if it has one).
 func (t *Tracker) Start(ctx context.Context, jobID, chatID, messageID int64, rawURL string, started time.Time, firstJoke string) {
-	js := &jobStatus{state: "queued", started: started, chatID: chatID, messageID: messageID,
+	js := &jobStatus{state: "queued", since: time.Now(), started: started, chatID: chatID, messageID: messageID,
 		quip: quipFor(rawURL), stopped: make(chan struct{})}
 	t.mu.Lock()
 	t.jobs[jobID] = js
@@ -313,6 +319,9 @@ func (t *Tracker) get(jobID int64) *jobStatus {
 func (t *Tracker) Set(jobID int64, state string, p *fetch.Progress) {
 	if js := t.get(jobID); js != nil {
 		js.mu.Lock()
+		if js.state != state {
+			js.since = time.Now()
+		}
 		js.state, js.progress = state, p
 		js.mu.Unlock()
 	}
@@ -361,6 +370,8 @@ func (t *Tracker) animate(ctx context.Context, js *jobStatus, joke string) {
 		joke = jokes.pick("queued")
 	}
 	moment, lastJoke := "queued", time.Now()
+	// When Telegram struggles, back off instead of editing every 3 s.
+	failures, nextEdit := 0, time.Time{}
 	tick := time.NewTicker(statusPollInterval)
 	defer tick.Stop()
 	for {
@@ -380,12 +391,21 @@ func (t *Tracker) animate(ctx context.Context, js *jobStatus, joke string) {
 			now += "/" + js.progress.Phase
 		}
 		if now != moment || time.Since(lastJoke) >= jokeUpdateInterval {
-			joke, moment, lastJoke = jokes.pick(jokeKind(js.state, js.progress, elapsed)), now, time.Now()
+			joke, moment, lastJoke = jokes.pick(jokeKind(js.state, js.progress, elapsed, time.Since(js.since))), now, time.Now()
+		}
+		if time.Now().Before(nextEdit) {
+			js.mu.Unlock()
+			continue
 		}
 		text := statusMessage(js.state, elapsed, js.progress, js.quip, joke)
 		ectx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		if err := t.tg.EditMessageText(ectx, js.chatID, js.messageID, text, false); err != nil {
-			slog.Warn("could not refresh Telegram status message", "err", err)
+			failures++
+			wait := min(maxEditBackoff, statusPollInterval<<failures)
+			nextEdit = time.Now().Add(wait)
+			slog.Warn("could not refresh Telegram status message", "err", err, "next_try_in", wait)
+		} else {
+			failures = 0
 		}
 		cancel()
 		js.mu.Unlock()
