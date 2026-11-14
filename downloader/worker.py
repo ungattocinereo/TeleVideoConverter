@@ -9,6 +9,7 @@ from datetime import datetime
 import redis as redis_sync
 import redis.asyncio as redis
 from telegram import Bot
+from telegram.error import NetworkError, RetryAfter
 from telegram.request import HTTPXRequest
 from ytdlp_wrapper import VideoDownloader
 from telegram_media import TelegramMediaPreparer, PreparedTelegramFile
@@ -42,6 +43,9 @@ TELEGRAM_LARGE_FILE_POLICY = os.getenv('TELEGRAM_LARGE_FILE_POLICY', 'compress_t
 WEB_PUBLIC_URL = os.getenv('WEB_PUBLIC_URL', 'https://televideo.cnr.pw')
 DOWNLOAD_STATUS_TTL_SECONDS = 4 * 60 * 60
 TERMINAL_STATUS_TTL_SECONDS = 5 * 60
+TELEGRAM_RETRY_ATTEMPTS = int(os.getenv('TELEGRAM_RETRY_ATTEMPTS', 5))
+TELEGRAM_RETRY_BASE_DELAY_SECONDS = float(os.getenv('TELEGRAM_RETRY_BASE_DELAY_SECONDS', 1))
+TELEGRAM_RETRY_MAX_DELAY_SECONDS = float(os.getenv('TELEGRAM_RETRY_MAX_DELAY_SECONDS', 15))
 
 class DownloadWorker:
     def __init__(self):
@@ -86,6 +90,48 @@ class DownloadWorker:
         await self.db.initialize()
         self.redis_client = await redis.from_url(f'redis://{REDIS_HOST}:{REDIS_PORT}')
         logger.info("Download worker initialized successfully")
+
+    async def telegram_request(self, operation: str, request_factory):
+        """Retry transient Telegram calls; factories may reopen upload files."""
+        attempts = max(1, TELEGRAM_RETRY_ATTEMPTS)
+
+        for attempt in range(1, attempts + 1):
+            try:
+                return await request_factory()
+            except RetryAfter as exc:
+                if attempt >= attempts:
+                    raise
+                retry_after = exc.retry_after
+                if hasattr(retry_after, 'total_seconds'):
+                    retry_after = retry_after.total_seconds()
+                delay = min(
+                    TELEGRAM_RETRY_MAX_DELAY_SECONDS,
+                    max(1.0, float(retry_after)),
+                )
+                logger.warning(
+                    "Telegram %s rate-limited (attempt %s/%s); retrying in %.1fs",
+                    operation,
+                    attempt,
+                    attempts,
+                    delay,
+                )
+            except NetworkError as exc:
+                if attempt >= attempts:
+                    raise
+                delay = min(
+                    TELEGRAM_RETRY_MAX_DELAY_SECONDS,
+                    TELEGRAM_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)),
+                )
+                logger.warning(
+                    "Telegram %s failed with %s (attempt %s/%s); retrying in %.1fs",
+                    operation,
+                    type(exc).__name__,
+                    attempt,
+                    attempts,
+                    delay,
+                )
+
+            await asyncio.sleep(delay)
 
     def get_terminal_message(self, state: str) -> str:
         """Return a shuffled success or failure message without early repeats."""
@@ -153,10 +199,13 @@ class DownloadWorker:
             return False
 
         try:
-            await self.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=status_message_id,
-                text=text,
+            await self.telegram_request(
+                "edit terminal status",
+                lambda: self.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_message_id,
+                    text=text,
+                ),
             )
             return True
         except Exception as exc:
@@ -197,11 +246,14 @@ class DownloadWorker:
 Source: {self._code(stats.get('source_platform', 'Unknown'))}
 Title: {html.escape(stats['title'])}"""
 
-        await self.bot.send_message(
-            chat_id=chat_id,
-            text=message,
-            parse_mode='HTML',
-            disable_web_page_preview=True,
+        await self.telegram_request(
+            "send statistics",
+            lambda: self.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode='HTML',
+                disable_web_page_preview=True,
+            ),
         )
 
     async def send_file(self, chat_id: int, file_path: str, thumbnail_path: str = None, width: int = None, height: int = None):
@@ -219,20 +271,26 @@ Title: {html.escape(stats['title'])}"""
                     )
                     return
 
-                with open(file_path, 'rb') as audio_file:
-                    await self.bot.send_audio(
-                        chat_id=chat_id,
-                        audio=audio_file
-                    )
+                async def send_audio_attempt():
+                    with open(file_path, 'rb') as audio_file:
+                        return await self.bot.send_audio(
+                            chat_id=chat_id,
+                            audio=audio_file,
+                        )
+
+                await self.telegram_request("send audio", send_audio_attempt)
                 return
 
             if file_size > self.telegram_preparer.target_bytes:
-                await self.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"🥧 File is {self._format_size(file_size)}. "
-                        "Compressing it for Telegram upload..."
-                    )
+                await self.telegram_request(
+                    "send compression notice",
+                    lambda: self.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"🥧 File is {self._format_size(file_size)}. "
+                            "Compressing it for Telegram upload..."
+                        ),
+                    ),
                 )
 
             prepared_files = self.telegram_preparer.prepare_telegram_files(file_path)
@@ -269,49 +327,58 @@ Title: {html.escape(stats['title'])}"""
     ):
         """Send one Telegram-sized video file."""
         if prepared_file.part_count > 1:
-            await self.bot.send_message(
-                chat_id=chat_id,
-                text=f"🥟 Sending compressed part {prepared_file.part_index}/{prepared_file.part_count}"
+            await self.telegram_request(
+                "send part notice",
+                lambda: self.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🥟 Sending compressed part {prepared_file.part_index}/{prepared_file.part_count}",
+                ),
             )
 
-        thumb = None
-        try:
+        async def send_video_attempt():
             with open(prepared_file.path, 'rb') as video_file:
-                if thumbnail_path and os.path.exists(thumbnail_path):
-                    thumb = open(thumbnail_path, 'rb')
+                thumb = None
+                try:
+                    if thumbnail_path and os.path.exists(thumbnail_path):
+                        thumb = open(thumbnail_path, 'rb')
 
-                send_params = {
-                    'chat_id': chat_id,
-                    'video': video_file,
-                    'thumbnail': thumb,
-                    'supports_streaming': True
-                }
+                    send_params = {
+                        'chat_id': chat_id,
+                        'video': video_file,
+                        'thumbnail': thumb,
+                        'supports_streaming': True,
+                    }
 
-                width = prepared_file.width or fallback_width
-                height = prepared_file.height or fallback_height
-                if width and height:
-                    send_params['width'] = width
-                    send_params['height'] = height
+                    width = prepared_file.width or fallback_width
+                    height = prepared_file.height or fallback_height
+                    if width and height:
+                        send_params['width'] = width
+                        send_params['height'] = height
 
-                if prepared_file.part_count > 1:
-                    send_params['caption'] = f"Part {prepared_file.part_index}/{prepared_file.part_count}"
+                    if prepared_file.part_count > 1:
+                        send_params['caption'] = f"Part {prepared_file.part_index}/{prepared_file.part_count}"
 
-                await self.bot.send_video(**send_params)
-        finally:
-            if thumb:
-                thumb.close()
+                    return await self.bot.send_video(**send_params)
+                finally:
+                    if thumb:
+                        thumb.close()
+
+        await self.telegram_request("send video", send_video_attempt)
 
     async def send_web_fallback(self, chat_id: int, file_size: int, reason: str):
         size_mb = file_size / (1024 * 1024)
         safe_reason = (reason or "Unknown error")[:1200]
-        await self.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"⚠️ Could not upload file directly to Telegram "
-                f"({size_mb:.1f} MB).\n\n"
-                f"Reason: {safe_reason}\n\n"
-                f"📥 Download via web interface:\n{WEB_PUBLIC_URL}"
-            )
+        await self.telegram_request(
+            "send web fallback",
+            lambda: self.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⚠️ Could not upload file directly to Telegram "
+                    f"({size_mb:.1f} MB).\n\n"
+                    f"Reason: {safe_reason}\n\n"
+                    f"📥 Download via web interface:\n{WEB_PUBLIC_URL}"
+                ),
+            ),
         )
 
     async def send_description(self, chat_id: int, description: str, title: str):
@@ -328,9 +395,12 @@ Title: {html.escape(stats['title'])}"""
 
             message = f"📝 Description:\n\n{description}"
 
-            await self.bot.send_message(
-                chat_id=chat_id,
-                text=message
+            await self.telegram_request(
+                "send description",
+                lambda: self.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                ),
             )
             logger.info(f"Description sent for: {title}")
 
@@ -371,7 +441,10 @@ Title: {html.escape(stats['title'])}"""
                 )
                 if chat_id != 0:
                     if not status_edited:
-                        await self.bot.send_message(chat_id=chat_id, text=error_text)
+                        await self.telegram_request(
+                            "send download error",
+                            lambda: self.bot.send_message(chat_id=chat_id, text=error_text),
+                        )
                 logger.error(f"Download failed: {url} - {result['error']}")
                 return
 
@@ -431,7 +504,10 @@ Title: {html.escape(stats['title'])}"""
                     success_text,
                 )
                 if not status_edited and task.get('status_message_id'):
-                    await self.bot.send_message(chat_id=chat_id, text=success_text)
+                    await self.telegram_request(
+                        "send completion status",
+                        lambda: self.bot.send_message(chat_id=chat_id, text=success_text),
+                    )
 
             logger.info(f"Download complete: {result['video_id']} ({self._format_size(result['file_size'])}, {self._format_duration(processing_time)}) [Source: {'Web' if chat_id == 0 else 'Telegram'}]")
 
@@ -441,7 +517,16 @@ Title: {html.escape(stats['title'])}"""
             status_edited = await self.finish_download_status(task, "error", error_text)
             if chat_id != 0:
                 if not status_edited:
-                    await self.bot.send_message(chat_id=chat_id, text=error_text)
+                    try:
+                        await self.telegram_request(
+                            "send processing error",
+                            lambda: self.bot.send_message(chat_id=chat_id, text=error_text),
+                        )
+                    except Exception as report_exc:
+                        logger.error(
+                            "Could not report processing error after Telegram retries: %s",
+                            type(report_exc).__name__,
+                        )
 
     async def ensure_redis_connection(self):
         """Ensure Redis connection is alive, reconnect if needed"""

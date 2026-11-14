@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from telegram.error import NetworkError
+
 from bot import TelegramBot
 from pelmeni_messages import QUEUED_MESSAGES, WORKING_MESSAGES, DELIVERING_MESSAGES
 
@@ -179,6 +181,40 @@ class PelmeniStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(task["status_key"].startswith("download_status:"))
         self.assertEqual(task["message_id"], 11)
         self.assertEqual(len(scheduled), 1)
+
+    async def test_url_is_queued_when_telegram_ack_exhausts_retries(self):
+        bot = self.make_bot()
+        bot.check_user_permission = Mock(return_value=True)
+        bot.check_rate_limit = Mock(return_value=True)
+        bot.db.get_stats = AsyncMock(return_value={"used_space_bytes": 0})
+
+        message = SimpleNamespace(
+            text="https://example.com/video",
+            chat_id=42,
+            message_id=11,
+            reply_text=AsyncMock(side_effect=NetworkError("offline")),
+        )
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=123),
+            message=message,
+        )
+        context = SimpleNamespace(
+            bot=SimpleNamespace(),
+            application=SimpleNamespace(create_task=Mock()),
+        )
+
+        with (
+            patch("bot.TELEGRAM_RETRY_ATTEMPTS", 2),
+            patch("bot.TELEGRAM_RETRY_BASE_DELAY_SECONDS", 0),
+            patch("bot.TELEGRAM_RETRY_MAX_DELAY_SECONDS", 0),
+        ):
+            await bot.handle_url(update, context)
+
+        self.assertEqual(message.reply_text.await_count, 2)
+        bot.redis_client.lpush.assert_awaited_once()
+        task = json.loads(bot.redis_client.lpush.await_args.args[1])
+        self.assertIsNone(task["status_message_id"])
+        context.application.create_task.assert_not_called()
 
 
 if __name__ == "__main__":

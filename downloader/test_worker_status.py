@@ -1,8 +1,13 @@
 import json
+import os
+import tempfile
 import unittest
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
+
+from telegram.error import NetworkError
 
 from pelmeni_messages import ERROR_MESSAGES, SUCCESS_MESSAGES
+from telegram_media import PreparedTelegramFile
 from worker import DownloadWorker
 
 
@@ -76,6 +81,54 @@ class WorkerStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             worker.bot.send_message.await_args.kwargs["disable_web_page_preview"],
         )
+
+    async def test_transient_telegram_failure_is_retried(self):
+        worker = self.make_worker()
+        request = AsyncMock(side_effect=[NetworkError("offline"), "ok"])
+
+        with (
+            patch("worker.TELEGRAM_RETRY_ATTEMPTS", 2),
+            patch("worker.TELEGRAM_RETRY_BASE_DELAY_SECONDS", 0),
+            patch("worker.TELEGRAM_RETRY_MAX_DELAY_SECONDS", 0),
+            patch("worker.asyncio.sleep", new=AsyncMock()),
+        ):
+            result = await worker.telegram_request("test request", request)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(request.await_count, 2)
+
+    async def test_video_file_is_reopened_for_retry(self):
+        worker = self.make_worker()
+        payloads = []
+
+        async def send_video(**kwargs):
+            payloads.append(kwargs["video"].read())
+            if len(payloads) == 1:
+                raise NetworkError("offline")
+
+        worker.bot.send_video = AsyncMock(side_effect=send_video)
+
+        with tempfile.NamedTemporaryFile(delete=False) as video_file:
+            video_file.write(b"video-payload")
+            video_path = video_file.name
+
+        try:
+            prepared = PreparedTelegramFile(
+                path=video_path,
+                width=320,
+                height=180,
+            )
+            with (
+                patch("worker.TELEGRAM_RETRY_ATTEMPTS", 2),
+                patch("worker.TELEGRAM_RETRY_BASE_DELAY_SECONDS", 0),
+                patch("worker.TELEGRAM_RETRY_MAX_DELAY_SECONDS", 0),
+                patch("worker.asyncio.sleep", new=AsyncMock()),
+            ):
+                await worker.send_prepared_video(42, prepared)
+        finally:
+            os.unlink(video_path)
+
+        self.assertEqual(payloads, [b"video-payload", b"video-payload"])
 
     def test_real_progress_is_serialized_for_telegram_bot(self):
         worker = self.make_worker()

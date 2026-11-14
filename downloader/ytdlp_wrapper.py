@@ -616,6 +616,26 @@ class VideoDownloader:
             'video not available, status code -1',
         ))
 
+    def _extract_instagram_info(self, url: str, ydl_opts: Dict) -> Dict:
+        """Select the first video before yt-dlp processes carousel photo entries."""
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False, process=False)
+            if info and 'entries' in info:
+                playlist = info
+                info = next((
+                    entry for entry in playlist['entries'] or []
+                    if entry and (entry.get('formats') or entry.get('url'))
+                ), None)
+                if info is None:
+                    raise ValueError('Instagram post contains no downloadable videos (photo-only carousel)')
+                info = dict(info)
+                for key in ('title', 'description', 'uploader', 'extractor_key', 'extractor'):
+                    if not info.get(key) and playlist.get(key):
+                        info[key] = playlist[key]
+            if not info:
+                raise ValueError('Instagram returned no media information')
+            return ydl.process_ie_result(info, download=True)
+
     def _extract_info(
         self,
         url: str,
@@ -625,6 +645,10 @@ class VideoDownloader:
         """Extract normally, with an official TikTok embed fallback for login redirects."""
         if self._is_threads_url(url):
             return self._extract_threads_info(url, ydl_opts)
+
+        hostname = (urlparse(url).hostname or '').lower()
+        if hostname == 'instagram.com' or hostname.endswith('.instagram.com'):
+            return self._extract_instagram_info(url, ydl_opts)
 
         direct_photo_match = re.search(r'/photo/(\d+)', url)
         if self._is_tiktok_url(url) and direct_photo_match:

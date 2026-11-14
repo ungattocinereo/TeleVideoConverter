@@ -6,7 +6,9 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from telegram import Update
+from telegram.error import NetworkError, RetryAfter, TelegramError
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest
 import redis.asyncio as redis
 import json
 from database import Database
@@ -40,6 +42,9 @@ JOKE_UPDATE_INTERVAL_SECONDS = 12
 DOWNLOAD_STATUS_TTL_SECONDS = 4 * 60 * 60
 TERMINAL_STATUS_STATES = {"done", "error"}
 PROGRESS_BAR_WIDTH = 16
+TELEGRAM_RETRY_ATTEMPTS = int(os.getenv('TELEGRAM_RETRY_ATTEMPTS', 5))
+TELEGRAM_RETRY_BASE_DELAY_SECONDS = float(os.getenv('TELEGRAM_RETRY_BASE_DELAY_SECONDS', 1))
+TELEGRAM_RETRY_MAX_DELAY_SECONDS = float(os.getenv('TELEGRAM_RETRY_MAX_DELAY_SECONDS', 15))
 STATUS_TITLES = {
     "queued": ("🥟", "Ссылка в пельменной очереди"),
     "working": ("🥟", "Пельмени скачивают и приводят видео в порядок"),
@@ -57,6 +62,48 @@ class TelegramBot:
         await self.db.initialize()
         self.redis_client = await redis.from_url(f'redis://{REDIS_HOST}:{REDIS_PORT}')
         logger.info(f"Bot initialized successfully. Authorized users: {ALLOWED_USER_IDS}")
+
+    async def telegram_request(self, operation: str, request_factory):
+        """Retry transient Telegram API failures without duplicating Redis work."""
+        attempts = max(1, TELEGRAM_RETRY_ATTEMPTS)
+
+        for attempt in range(1, attempts + 1):
+            try:
+                return await request_factory()
+            except RetryAfter as exc:
+                if attempt >= attempts:
+                    raise
+                retry_after = exc.retry_after
+                if hasattr(retry_after, 'total_seconds'):
+                    retry_after = retry_after.total_seconds()
+                delay = min(
+                    TELEGRAM_RETRY_MAX_DELAY_SECONDS,
+                    max(1.0, float(retry_after)),
+                )
+                logger.warning(
+                    "Telegram %s rate-limited (attempt %s/%s); retrying in %.1fs",
+                    operation,
+                    attempt,
+                    attempts,
+                    delay,
+                )
+            except NetworkError as exc:
+                if attempt >= attempts:
+                    raise
+                delay = min(
+                    TELEGRAM_RETRY_MAX_DELAY_SECONDS,
+                    TELEGRAM_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)),
+                )
+                logger.warning(
+                    "Telegram %s failed with %s (attempt %s/%s); retrying in %.1fs",
+                    operation,
+                    type(exc).__name__,
+                    attempt,
+                    attempts,
+                    delay,
+                )
+
+            await asyncio.sleep(delay)
 
     def check_user_permission(self, user_id: int) -> bool:
         """Check if user is allowed to use the bot"""
@@ -428,13 +475,24 @@ Supported platforms: YouTube, Vimeo, and many more!
             await update.message.reply_text("❌ Storage limit reached (5GB). Please wait for old files to be deleted.")
             return
 
-        # Send one status message that will be edited throughout the download.
+        # Try to send one status message that will be edited throughout the
+        # download. A Telegram outage must not discard the user's URL.
         status_started_at = time.monotonic()
         initial_joke = self.get_status_joke("queued")
-        status_message = await update.message.reply_text(
-            self.build_status_message("queued", 0, joke=initial_joke)
-        )
         status_key = f"download_status:{uuid.uuid4().hex}"
+        status_message = None
+        try:
+            status_message = await self.telegram_request(
+                "send queued status",
+                lambda: update.message.reply_text(
+                    self.build_status_message("queued", 0, joke=initial_joke)
+                ),
+            )
+        except TelegramError as exc:
+            logger.error(
+                "Could not send queued status after retries (%s); queueing download without it",
+                type(exc).__name__,
+            )
 
         # Create download task with best quality
         task = {
@@ -443,7 +501,7 @@ Supported platforms: YouTube, Vimeo, and many more!
             'user_id': user_id,
             'chat_id': update.message.chat_id,
             'message_id': update.message.message_id,
-            'status_message_id': status_message.message_id,
+            'status_message_id': status_message.message_id if status_message else None,
             'status_key': status_key,
         }
 
@@ -458,25 +516,30 @@ Supported platforms: YouTube, Vimeo, and many more!
             logger.error(f"Could not queue download task: {exc}")
             try:
                 await self.redis_client.set(status_key, "error", ex=300)
-                await status_message.edit_text(
-                    "❌ Пельменная очередь исчезла вместе с номерками.\n\n"
-                    f"Техническая причина: {str(exc)[:800]}"
-                )
+                if status_message:
+                    await self.telegram_request(
+                        "report queue failure",
+                        lambda: status_message.edit_text(
+                            "❌ Пельменная очередь исчезла вместе с номерками.\n\n"
+                            f"Техническая причина: {str(exc)[:800]}"
+                        ),
+                    )
             except Exception as status_exc:
                 logger.warning(f"Could not report queue failure in Telegram: {status_exc}")
             return
 
-        context.application.create_task(
-            self.animate_download_status(
-                context.bot,
-                update.message.chat_id,
-                status_message.message_id,
-                status_key,
-                status_started_at,
-                initial_joke,
-            ),
-            update=update,
-        )
+        if status_message:
+            context.application.create_task(
+                self.animate_download_status(
+                    context.bot,
+                    update.message.chat_id,
+                    status_message.message_id,
+                    status_key,
+                    status_started_at,
+                    initial_joke,
+                ),
+                update=update,
+            )
 
         logger.info(f"Added download task to queue: {url} (best quality) for user {user_id}")
 
@@ -492,8 +555,29 @@ def main():
     """Start the bot"""
     bot = TelegramBot()
 
-    # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Use explicit timeouts for unreliable local/upstream connections. Polling
+    # gets its own client because it can hold a request open for a long time.
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=30.0,
+    )
+    get_updates_request = HTTPXRequest(
+        connection_pool_size=2,
+        connect_timeout=30.0,
+        read_timeout=45.0,
+        write_timeout=30.0,
+        pool_timeout=30.0,
+    )
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .get_updates_request(get_updates_request)
+        .build()
+    )
 
     # Add handlers
     application.add_handler(CommandHandler("start", bot.start_command))
