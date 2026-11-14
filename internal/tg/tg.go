@@ -95,21 +95,51 @@ func (c *Client) sanitize(err error) error {
 	return errors.New(strings.ReplaceAll(err.Error(), c.token, "<token>"))
 }
 
+// slowCall is the duration above which a call is logged with its timing
+// breakdown (how long the upload took vs. how long Telegram thought).
+const slowCall = 3 * time.Second
+
+// bodyTimer records when the request body has been fully read (sent).
+type bodyTimer struct {
+	r    io.Reader
+	n    int64
+	done time.Time
+}
+
+func (b *bodyTimer) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	b.n += int64(n)
+	if err == io.EOF && b.done.IsZero() {
+		b.done = time.Now()
+	}
+	return n, err
+}
+
 func (c *Client) do(ctx context.Context, hc *http.Client, method string, body func() (io.Reader, string, error), out any) error {
 	reader, contentType, err := body()
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+method, reader)
+	bt := &bodyTimer{r: reader}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+method, bt)
 	if err != nil {
 		return c.sanitize(err)
 	}
 	req.Header.Set("Content-Type", contentType)
+	start := time.Now()
 	resp, err := hc.Do(req)
 	if err != nil {
 		return c.sanitize(err)
 	}
 	defer resp.Body.Close()
+	if took := time.Since(start); took > slowCall && method != "getUpdates" {
+		attrs := []any{"method", method, "took", took.Round(time.Millisecond), "bytes", bt.n}
+		if !bt.done.IsZero() {
+			attrs = append(attrs, "upload", bt.done.Sub(start).Round(time.Millisecond),
+				"telegram_processing", time.Since(bt.done).Round(time.Millisecond))
+		}
+		slog.Info("slow telegram call", attrs...)
+	}
 	var r response
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
 		return fmt.Errorf("telegram %s: bad response (HTTP %d): %w", method, resp.StatusCode, err)
@@ -268,7 +298,41 @@ type VideoParams struct {
 	Thumbnail     string // local JPEG path, optional
 }
 
-func (c *Client) SendVideo(ctx context.Context, chatID int64, path string, p VideoParams) error {
+// sentMedia is the part of a sent Message we care about: the file_id of
+// whatever Telegram turned the upload into (short silent clips can come
+// back as an animation).
+type sentMedia struct {
+	Video *struct {
+		FileID string `json:"file_id"`
+	} `json:"video"`
+	Animation *struct {
+		FileID string `json:"file_id"`
+	} `json:"animation"`
+	Document *struct {
+		FileID string `json:"file_id"`
+	} `json:"document"`
+	Audio *struct {
+		FileID string `json:"file_id"`
+	} `json:"audio"`
+}
+
+func (m *sentMedia) fileID() string {
+	switch {
+	case m.Video != nil:
+		return m.Video.FileID
+	case m.Animation != nil:
+		return m.Animation.FileID
+	case m.Document != nil:
+		return m.Document.FileID
+	case m.Audio != nil:
+		return m.Audio.FileID
+	}
+	return ""
+}
+
+// SendVideo uploads a video and returns Telegram's file_id for it, which
+// SendVideoByID can reuse without uploading again.
+func (c *Client) SendVideo(ctx context.Context, chatID int64, path string, p VideoParams) (string, error) {
 	fields := map[string]string{
 		"chat_id":            strconv.FormatInt(chatID, 10),
 		"supports_streaming": "true",
@@ -286,16 +350,30 @@ func (c *Client) SendVideo(ctx context.Context, chatID int64, path string, p Vid
 	files := map[string]string{"video": path}
 	if p.Thumbnail != "" {
 		if _, err := os.Stat(p.Thumbnail); err == nil {
-			files["thumbnail"] = p.Thumbnail
+			files["thumb_file"] = p.Thumbnail
+			fields["thumbnail"] = "attach://thumb_file"
 		}
 	}
-	return c.Upload(ctx, "sendVideo", fields, files, nil)
+	var m sentMedia
+	err := c.Upload(ctx, "sendVideo", fields, files, &m)
+	return m.fileID(), err
 }
 
-func (c *Client) SendAudio(ctx context.Context, chatID int64, path, title string) error {
+// SendVideoByID re-sends a video Telegram already has.
+func (c *Client) SendVideoByID(ctx context.Context, chatID int64, fileID string, p VideoParams) error {
+	params := map[string]any{"chat_id": chatID, "video": fileID, "supports_streaming": true}
+	if p.Caption != "" {
+		params["caption"] = p.Caption
+	}
+	return c.Call(ctx, "sendVideo", params, nil)
+}
+
+func (c *Client) SendAudio(ctx context.Context, chatID int64, path, title string) (string, error) {
 	fields := map[string]string{"chat_id": strconv.FormatInt(chatID, 10)}
 	if title != "" {
 		fields["title"] = title
 	}
-	return c.Upload(ctx, "sendAudio", fields, map[string]string{"audio": path}, nil)
+	var m sentMedia
+	err := c.Upload(ctx, "sendAudio", fields, map[string]string{"audio": path}, &m)
+	return m.fileID(), err
 }

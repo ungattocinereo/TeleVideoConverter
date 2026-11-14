@@ -46,18 +46,18 @@ func TestSendVideoMultipartAndRetryOn429(t *testing.T) {
 		if n != 3<<20 {
 			t.Errorf("video size %d", n)
 		}
-		if _, _, err := r.FormFile("thumbnail"); err != nil {
+		if _, _, err := r.FormFile("thumb_file"); err != nil || r.FormValue("thumbnail") != "attach://thumb_file" {
 			t.Error("thumbnail missing")
 		}
-		json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": map[string]any{}})
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": map[string]any{"video": map[string]string{"file_id": "FID"}}})
 	}))
 	defer srv.Close()
 
 	c := New("123:SECRET", 3, 10*time.Millisecond, 2*time.Second)
 	c.base = srv.URL + "/bot123:SECRET/"
-	err := c.SendVideo(context.Background(), 42, video, VideoParams{Width: 720, Height: 1280, Duration: 12, Caption: "Part 1/2", Thumbnail: thumb})
-	if err != nil {
-		t.Fatal(err)
+	fid, err := c.SendVideo(context.Background(), 42, video, VideoParams{Width: 720, Height: 1280, Duration: 12, Caption: "Part 1/2", Thumbnail: thumb})
+	if err != nil || fid != "FID" {
+		t.Fatalf("fid=%q err=%v", fid, err)
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("calls = %d, want 2 (one retry)", calls.Load())

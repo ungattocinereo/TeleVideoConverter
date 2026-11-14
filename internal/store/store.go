@@ -34,6 +34,10 @@ type Video struct {
 	DownloadSeconds   *float64 `json:"download_seconds"`
 	ProcessSeconds    *float64 `json:"process_seconds"`
 	SendSeconds       *float64 `json:"send_seconds"`
+	// Telegram file_id of the last upload and the file size it was made
+	// from, so a re-requested video is re-sent without uploading again.
+	TelegramFileID   *string `json:"-"`
+	TelegramFileSize *int64  `json:"-"`
 }
 
 type Stats struct {
@@ -129,8 +133,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 	// Stage timings, added by the Go version. Old code ignores extra columns.
-	for _, col := range []string{"download_seconds", "process_seconds", "send_seconds"} {
-		if err := s.addColumnIfMissing(ctx, "videos", col, "REAL"); err != nil {
+	for col, typ := range map[string]string{"download_seconds": "REAL", "process_seconds": "REAL", "send_seconds": "REAL",
+		"telegram_file_id": "TEXT", "telegram_file_size": "INTEGER"} {
+		if err := s.addColumnIfMissing(ctx, "videos", col, typ); err != nil {
 			return err
 		}
 	}
@@ -164,7 +169,7 @@ func (s *Store) addColumnIfMissing(ctx context.Context, table, column, typ strin
 const videoCols = `id, video_id, telegram_user_id, original_url, title, original_quality,
 	downloaded_quality, file_size, processing_time, format, codec, source_platform,
 	file_path, thumbnail_path, download_timestamp, delete_timestamp,
-	download_seconds, process_seconds, send_seconds`
+	download_seconds, process_seconds, send_seconds, telegram_file_id, telegram_file_size`
 
 func scanVideos(rows *sql.Rows) ([]Video, error) {
 	defer rows.Close()
@@ -174,7 +179,8 @@ func scanVideos(rows *sql.Rows) ([]Video, error) {
 		if err := rows.Scan(&v.ID, &v.VideoID, &v.TelegramUserID, &v.OriginalURL, &v.Title,
 			&v.OriginalQuality, &v.DownloadedQuality, &v.FileSize, &v.ProcessingTime, &v.Format,
 			&v.Codec, &v.SourcePlatform, &v.FilePath, &v.ThumbnailPath, &v.DownloadTimestamp,
-			&v.DeleteTimestamp, &v.DownloadSeconds, &v.ProcessSeconds, &v.SendSeconds); err != nil {
+			&v.DeleteTimestamp, &v.DownloadSeconds, &v.ProcessSeconds, &v.SendSeconds,
+			&v.TelegramFileID, &v.TelegramFileSize); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -209,6 +215,13 @@ func (s *Store) SaveVideo(ctx context.Context, v *Video) error {
 		return err
 	}
 	return s.AddStat(ctx, v.TelegramUserID, v.VideoID, "download")
+}
+
+// SetTelegramFile remembers the file_id Telegram gave a single-part upload.
+func (s *Store) SetTelegramFile(ctx context.Context, videoID, fileID string, size int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE videos SET telegram_file_id = ?, telegram_file_size = ? WHERE video_id = ?`,
+		fileID, size, videoID)
+	return err
 }
 
 func (s *Store) SetSendSeconds(ctx context.Context, videoID string, secs float64) error {

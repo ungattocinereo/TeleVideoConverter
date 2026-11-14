@@ -153,14 +153,24 @@ func (w *Worker) process(ctx context.Context, job *store.Job) {
 		if err := w.sendStats(ctx, job.ChatID, v); err != nil {
 			log.Warn("could not send stats", "err", err)
 		}
-		w.sendFile(ctx, job.ChatID, filePath, deref(v.ThumbnailPath), width, height, duration, res.Audio, v.Title,
+		statsDone := time.Now()
+		cached := ""
+		if row, err := w.store.GetVideo(ctx, v.VideoID); err == nil && row != nil &&
+			row.TelegramFileID != nil && row.TelegramFileSize != nil && *row.TelegramFileSize == v.FileSize {
+			cached = *row.TelegramFileID
+		}
+		how := w.sendFile(ctx, job.ChatID, v.VideoID, cached, filePath, deref(v.ThumbnailPath), width, height, duration, res.Audio, v.Title,
 			func(phase string) { w.tracker.Phase(job.ID, "delivering", phase) })
+		fileDone := time.Now()
 		if w.wantsDescription(ctx, job.UserID) {
 			w.sendDescription(ctx, job.ChatID, res.Description)
 		}
 		sendSecs := time.Since(sendStart).Seconds()
 		w.store.SetSendSeconds(ctx, v.VideoID, sendSecs)
-		log.Info("delivered", "video", v.VideoID, "send_s", fmt.Sprintf("%.1f", sendSecs))
+		log.Info("delivered", "video", v.VideoID, "send_s", fmt.Sprintf("%.1f", sendSecs), "how", how,
+			"stats_s", fmt.Sprintf("%.1f", statsDone.Sub(sendStart).Seconds()),
+			"file_s", fmt.Sprintf("%.1f", fileDone.Sub(statsDone).Seconds()),
+			"description_s", fmt.Sprintf("%.1f", time.Since(fileDone).Seconds()))
 		text := fmt.Sprintf("🥟 Пельмени всплыли · %s\n\n%s", ruDuration(processing), jokes.pick("done"))
 		if !w.tracker.Finish(ctx, job.ID, text) && job.StatusMessageID != 0 {
 			w.tg.SendMessage(ctx, job.ChatID, text, tg.SendOpts{})
@@ -175,6 +185,7 @@ func (w *Worker) process(ctx context.Context, job *store.Job) {
 // the database row.
 func (w *Worker) finalize(ctx context.Context, res *fetch.Result, log *slog.Logger, phase func(string)) (v *store.Video, path string, width, height int, duration float64, err error) {
 	path = res.FilePath
+	probedCodec := ""
 	format := strings.TrimPrefix(filepath.Ext(path), ".")
 	if !res.Audio {
 		out := filepath.Join(w.cfg.StoragePath, "videos", res.VideoID+".mp4")
@@ -192,6 +203,7 @@ func (w *Worker) finalize(ctx context.Context, res *fetch.Result, log *slog.Logg
 			if nr, nerr := w.media.Normalize(ctx, path, out); nerr == nil {
 				path = nr.Path
 				width, height, duration = nr.Probe.Width, nr.Probe.Height, nr.Probe.Duration
+				probedCodec = nr.Probe.VideoCodec
 				log.Info("normalized", "action", nr.Action, "codec", nr.Probe.VideoCodec, "took_s", fmt.Sprintf("%.1f", nr.Elapsed.Seconds()))
 			} else {
 				if ctx.Err() != nil {
@@ -220,6 +232,9 @@ func (w *Worker) finalize(ctx context.Context, res *fetch.Result, log *slog.Logg
 	}
 	if !res.Audio {
 		codec := res.VCodec
+		if codec == "" || codec == "none" {
+			codec = probedCodec
+		}
 		if codec == "" {
 			codec = "unknown"
 		}
@@ -310,21 +325,33 @@ func (w *Worker) limits() media.Limits {
 		MinVideoKbps: w.cfg.MinVideoKbps, AudioKbps: w.cfg.AudioKbps, Policy: w.cfg.LargeFilePolicy}
 }
 
-func (w *Worker) sendFile(ctx context.Context, chat int64, path, thumb string, width, height int, duration float64, audio bool, title string, phase func(string)) {
+// sendFile delivers the video (or audio) and reports how: "file_id",
+// "upload", "parts" or "fallback".
+func (w *Worker) sendFile(ctx context.Context, chat int64, videoID, cachedFileID, path, thumb string, width, height int,
+	duration float64, audio bool, title string, phase func(string)) string {
 	st, err := os.Stat(path)
 	if err != nil {
 		w.webFallback(ctx, chat, 0, err.Error())
-		return
+		return "fallback"
 	}
 	if audio {
 		if st.Size() > w.cfg.SendLimitBytes {
 			w.webFallback(ctx, chat, st.Size(), "аудиофайл больше лимита Telegram для ботов")
-			return
+			return "fallback"
 		}
-		if err := w.tg.SendAudio(ctx, chat, path, title); err != nil {
+		if _, err := w.tg.SendAudio(ctx, chat, path, title); err != nil {
 			w.webFallback(ctx, chat, st.Size(), err.Error())
+			return "fallback"
 		}
-		return
+		return "upload"
+	}
+	// Telegram already has this exact file: re-send it without uploading.
+	if cachedFileID != "" {
+		if err := w.tg.SendVideoByID(ctx, chat, cachedFileID, tg.VideoParams{}); err == nil {
+			return "file_id"
+		} else {
+			slog.Warn("re-send by file_id failed, uploading again", "err", err)
+		}
 	}
 	if st.Size() > w.cfg.TargetBytes {
 		phase("compressing")
@@ -333,7 +360,7 @@ func (w *Worker) sendFile(ctx context.Context, chat int64, path, thumb string, w
 	parts, err := w.media.PrepareForTelegram(ctx, w.limits(), path, filepath.Join(w.cfg.StoragePath, "telegram"))
 	if err != nil {
 		w.webFallback(ctx, chat, st.Size(), err.Error())
-		return
+		return "fallback"
 	}
 	defer media.Cleanup(parts)
 	phase("uploading")
@@ -351,16 +378,24 @@ func (w *Worker) sendFile(ctx context.Context, chat int64, path, thumb string, w
 		if p.Count > 1 {
 			vp.Caption = fmt.Sprintf("🥟 Порция %d/%d", p.Index, p.Count)
 		}
-		if err := w.tg.SendVideo(ctx, chat, p.Path, vp); err != nil {
+		fileID, err := w.tg.SendVideo(ctx, chat, p.Path, vp)
+		if err != nil {
 			var apiErr *tg.APIError
 			reason := err.Error()
 			if errors.As(err, &apiErr) {
 				reason = apiErr.Description
 			}
 			w.webFallback(ctx, chat, st.Size(), reason)
-			return
+			return "fallback"
+		}
+		if p.Count == 1 && fileID != "" {
+			w.store.SetTelegramFile(ctx, videoID, fileID, st.Size())
 		}
 	}
+	if len(parts) > 1 {
+		return "parts"
+	}
+	return "upload"
 }
 
 func (w *Worker) webFallback(ctx context.Context, chat int64, size int64, reason string) {
