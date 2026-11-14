@@ -46,3 +46,6 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Telegram upload temp copies
+storage/telegram/*
