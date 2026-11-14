@@ -6,6 +6,7 @@ package tg
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,13 +33,29 @@ type Client struct {
 	maxDelay  time.Duration
 }
 
+// transport returns a dedicated HTTP/1.1 transport. Polling, regular calls
+// and uploads each get their own connections: sharing one HTTP/2
+// connection made small uploads wait minutes behind the long poll.
+func transport() *http.Transport {
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     false,
+		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
+		MaxIdleConnsPerHost:   4,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 0,
+		ExpectContinueTimeout: time.Second,
+	}
+}
+
 func New(token string, attempts int, baseDelay, maxDelay time.Duration) *Client {
 	return &Client{
 		token:     token,
 		base:      "https://api.telegram.org/bot" + token + "/",
-		api:       &http.Client{Timeout: 30 * time.Second},
-		poll:      &http.Client{Timeout: 45 * time.Second},
-		upload:    &http.Client{Timeout: 10 * time.Minute},
+		api:       &http.Client{Timeout: 30 * time.Second, Transport: transport()},
+		poll:      &http.Client{Timeout: 45 * time.Second, Transport: transport()},
+		upload:    &http.Client{Timeout: 10 * time.Minute, Transport: transport()},
 		attempts:  max(1, attempts),
 		baseDelay: baseDelay,
 		maxDelay:  maxDelay,
@@ -115,8 +133,11 @@ func (b *bodyTimer) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (c *Client) do(ctx context.Context, hc *http.Client, method string, body func() (io.Reader, string, error), out any) error {
-	reader, contentType, err := body()
+// body produces a request body, its content type and its exact length.
+type body func() (io.Reader, string, int64, error)
+
+func (c *Client) do(ctx context.Context, hc *http.Client, method string, mk body, out any) error {
+	reader, contentType, length, err := mk()
 	if err != nil {
 		return err
 	}
@@ -125,6 +146,7 @@ func (c *Client) do(ctx context.Context, hc *http.Client, method string, body fu
 	if err != nil {
 		return c.sanitize(err)
 	}
+	req.ContentLength = length
 	req.Header.Set("Content-Type", contentType)
 	start := time.Now()
 	resp, err := hc.Do(req)
@@ -189,10 +211,10 @@ func (c *Client) retry(ctx context.Context, op string, fn func() error) error {
 	return err
 }
 
-func jsonBody(params any) func() (io.Reader, string, error) {
-	return func() (io.Reader, string, error) {
+func jsonBody(params any) body {
+	return func() (io.Reader, string, int64, error) {
 		b, err := json.Marshal(params)
-		return bytes.NewReader(b), "application/json", err
+		return bytes.NewReader(b), "application/json", int64(len(b)), err
 	}
 }
 
@@ -255,40 +277,83 @@ func (c *Client) EditMessageText(ctx context.Context, chatID, messageID int64, t
 	return err
 }
 
-// Upload sends a multipart request. files maps form field -> local path. The
-// files are reopened on every retry attempt and streamed, never buffered.
+// countWriter counts bytes, to size a multipart body before sending it.
+type countWriter struct{ n int64 }
+
+func (w *countWriter) Write(p []byte) (int, error) { w.n += int64(len(p)); return len(p), nil }
+
+// writeMultipart writes fields and files; with dry=true file contents are
+// skipped (only their sizes are counted) to compute Content-Length.
+func writeMultipart(w io.Writer, boundary string, fields map[string]string, files map[string]string, dry bool) (string, int64, error) {
+	cw := &countWriter{}
+	mw := multipart.NewWriter(io.MultiWriter(w, cw))
+	if err := mw.SetBoundary(boundary); err != nil {
+		return "", 0, err
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if err := mw.WriteField(k, fields[k]); err != nil {
+			return "", 0, err
+		}
+	}
+	names := make([]string, 0, len(files))
+	for k := range files {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	var fileBytes int64
+	for _, field := range names {
+		path := files[field]
+		part, err := mw.CreateFormFile(field, filepath.Base(path))
+		if err != nil {
+			return "", 0, err
+		}
+		if dry {
+			st, err := os.Stat(path)
+			if err != nil {
+				return "", 0, err
+			}
+			fileBytes += st.Size()
+			continue
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return "", 0, err
+		}
+		_, err = io.Copy(part, f)
+		f.Close()
+		if err != nil {
+			return "", 0, err
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return "", 0, err
+	}
+	return mw.FormDataContentType(), cw.n + fileBytes, nil
+}
+
+// Upload sends a multipart request with an exact Content-Length. files maps
+// form field -> local path; files are streamed from disk (reopened on every
+// retry), never buffered in memory.
 func (c *Client) Upload(ctx context.Context, method string, fields map[string]string, files map[string]string, out any) error {
-	body := func() (io.Reader, string, error) {
+	boundary := multipart.NewWriter(io.Discard).Boundary()
+	mk := func() (io.Reader, string, int64, error) {
+		contentType, length, err := writeMultipart(io.Discard, boundary, fields, files, true)
+		if err != nil {
+			return nil, "", 0, err
+		}
 		pr, pw := io.Pipe()
-		mw := multipart.NewWriter(pw)
 		go func() {
-			err := func() error {
-				for k, v := range fields {
-					if err := mw.WriteField(k, v); err != nil {
-						return err
-					}
-				}
-				for field, path := range files {
-					f, err := os.Open(path)
-					if err != nil {
-						return err
-					}
-					part, err := mw.CreateFormFile(field, filepath.Base(path))
-					if err == nil {
-						_, err = io.Copy(part, f)
-					}
-					f.Close()
-					if err != nil {
-						return err
-					}
-				}
-				return mw.Close()
-			}()
+			_, _, err := writeMultipart(pw, boundary, fields, files, false)
 			pw.CloseWithError(err)
 		}()
-		return pr, mw.FormDataContentType(), nil
+		return pr, contentType, length, nil
 	}
-	return c.retry(ctx, method, func() error { return c.do(ctx, c.upload, method, body, out) })
+	return c.retry(ctx, method, func() error { return c.do(ctx, c.upload, method, mk, out) })
 }
 
 type VideoParams struct {

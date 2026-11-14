@@ -1,6 +1,7 @@
 package tg
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -26,6 +27,11 @@ func TestSendVideoMultipartAndRetryOn429(t *testing.T) {
 		if !strings.HasSuffix(r.URL.Path, "/sendVideo") {
 			t.Errorf("path %s", r.URL.Path)
 		}
+		raw, _ := io.ReadAll(r.Body)
+		if r.ContentLength <= 0 || r.ContentLength != int64(len(raw)) {
+			t.Errorf("Content-Length %d, body %d bytes", r.ContentLength, len(raw))
+		}
+		r.Body = io.NopCloser(bytes.NewReader(raw))
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			t.Fatal(err)
 		}
