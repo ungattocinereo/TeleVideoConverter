@@ -60,3 +60,25 @@ func TestCopyRule(t *testing.T) {
 		}
 	}
 }
+
+func TestStandardFPSAndEncodePlan(t *testing.T) {
+	for in, want := range map[float64]int{28.79: 30, 30.006: 30, 23.976: 24, 25: 25, 59.94: 60, 0: 30} {
+		if got := StandardFPS(in); got != want {
+			t.Errorf("StandardFPS(%v) = %d, want %d", in, got, want)
+		}
+	}
+	h264 := Probe{HasVideo: true, VideoCodec: "h264", PixFmt: "yuv420p", Width: 720, Height: 720}
+	if !h264.WillEncode(400<<10, 48<<20) {
+		t.Error("small H.264 must be encoded for Telegram")
+	}
+	if h264.WillEncode(300<<20, 48<<20) {
+		t.Error("large H.264 should only be remuxed")
+	}
+	hevc := Probe{HasVideo: true, VideoCodec: "hevc", PixFmt: "yuv420p", Width: 720, Height: 720}
+	if !hevc.WillEncode(300<<20, 48<<20) {
+		t.Error("HEVC must always be encoded")
+	}
+	if parseRate("197100000/6568643") < 30 || parseRate("30/1") != 30 {
+		t.Error("parseRate")
+	}
+}

@@ -36,6 +36,7 @@ type Probe struct {
 	PixFmt     string
 	AudioCodec string
 	Container  string
+	FPS        float64 // average frame rate
 }
 
 func (t Tools) Probe(ctx context.Context, path string) (*Probe, error) {
@@ -50,6 +51,7 @@ func (t Tools) Probe(ctx context.Context, path string) (*Probe, error) {
 			CodecName string `json:"codec_name"`
 			Profile   string `json:"profile"`
 			PixFmt    string `json:"pix_fmt"`
+			AvgFPS    string `json:"avg_frame_rate"`
 			Width     int    `json:"width"`
 			Height    int    `json:"height"`
 			Duration  string `json:"duration"`
@@ -73,6 +75,7 @@ func (t Tools) Probe(ctx context.Context, path string) (*Probe, error) {
 			p.HasVideo = true
 			p.VideoCodec, p.Profile, p.PixFmt = s.CodecName, s.Profile, s.PixFmt
 			p.Width, p.Height = s.Width, s.Height
+			p.FPS = parseRate(s.AvgFPS)
 			if p.Duration <= 0 {
 				p.Duration, _ = strconv.ParseFloat(s.Duration, 64)
 			}
@@ -103,8 +106,43 @@ func (p *Probe) audioPlaysEverywhere() bool {
 	return !p.HasAudio || p.AudioCodec == "aac" || p.AudioCodec == "mp3"
 }
 
-// NeedsEncode reports whether Normalize would have to re-encode video.
-func (p *Probe) NeedsEncode() bool { return p.HasVideo && !p.videoPlaysEverywhere() }
+func parseRate(r string) float64 {
+	num, den, ok := strings.Cut(r, "/")
+	n, err1 := strconv.ParseFloat(num, 64)
+	if !ok {
+		return n
+	}
+	d, err2 := strconv.ParseFloat(den, 64)
+	if err1 != nil || err2 != nil || d == 0 {
+		return 0
+	}
+	return n / d
+}
+
+// StandardFPS picks the nearest common frame rate for a constant-rate
+// encode (Threads' 28.79 and X's 30.006 become 30).
+func StandardFPS(fps float64) int {
+	best := 30
+	for _, r := range []int{24, 25, 30, 50, 60} {
+		if fps > 0 && math.Abs(fps-float64(r)) < math.Abs(fps-float64(best)) {
+			best = r
+		}
+	}
+	return best
+}
+
+// WillEncode reports whether Normalize re-encodes the video. Telegram
+// re-processes remuxed social-media files (irregular timestamps) for 15 s
+// to several minutes, but takes a constant-frame-rate H.264 encode
+// instantly, so everything that is sent as-is gets encoded. Files above
+// remuxAbove are only remuxed: Telegram receives a compressed CFR copy
+// of those anyway (PrepareForTelegram).
+func (p *Probe) WillEncode(size, remuxAbove int64) bool {
+	if !p.HasVideo {
+		return false
+	}
+	return !p.videoPlaysEverywhere() || size <= remuxAbove
+}
 
 type NormalizeResult struct {
 	Path    string
@@ -116,7 +154,7 @@ type NormalizeResult struct {
 // Normalize turns a downloaded file into <dir>/<id>.mp4 that Telegram plays
 // on every client. Compatible streams are only remuxed (with faststart);
 // everything else is re-encoded once with libx264/AAC.
-func (t Tools) Normalize(ctx context.Context, in, out string) (*NormalizeResult, error) {
+func (t Tools) Normalize(ctx context.Context, in, out string, remuxAbove int64) (*NormalizeResult, error) {
 	start := time.Now()
 	p, err := t.Probe(ctx, in)
 	if err != nil {
@@ -125,7 +163,11 @@ func (t Tools) Normalize(ctx context.Context, in, out string) (*NormalizeResult,
 	if !p.HasVideo {
 		return nil, fmt.Errorf("downloaded file has no video stream")
 	}
-	copyVideo, copyAudio := p.videoPlaysEverywhere(), p.audioPlaysEverywhere()
+	st, err := os.Stat(in)
+	if err != nil {
+		return nil, err
+	}
+	copyVideo, copyAudio := !p.WillEncode(st.Size(), remuxAbove), p.audioPlaysEverywhere()
 	action := "remux"
 	switch {
 	case !copyVideo:
@@ -140,7 +182,8 @@ func (t Tools) Normalize(ctx context.Context, in, out string) (*NormalizeResult,
 		args = append(args, "-c:v", "copy")
 	} else {
 		args = append(args, t.x264Args()...)
-		args = append(args, "-crf", "23", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p")
+		args = append(args, "-crf", "23", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+			"-fps_mode", "cfr", "-r", strconv.Itoa(StandardFPS(p.FPS)))
 	}
 	if copyAudio {
 		args = append(args, "-c:a", "copy")
@@ -351,7 +394,7 @@ func (t Tools) PrepareForTelegram(ctx context.Context, l Limits, path, tmpDir st
 			if attempt == 1 {
 				kbps = int(float64(vk) * 0.85)
 			}
-			if err := t.compressPart(ctx, path, out, startAt, dur, count > 1, p.HasAudio, kbps, ak, MaxSide(kbps)); err != nil {
+			if err := t.compressPart(ctx, path, out, startAt, dur, p.FPS, count > 1, p.HasAudio, kbps, ak, MaxSide(kbps)); err != nil {
 				os.Remove(out)
 				cleanup()
 				return nil, err
@@ -384,7 +427,7 @@ func (t Tools) PrepareForTelegram(ctx context.Context, l Limits, path, tmpDir st
 	return parts, nil
 }
 
-func (t Tools) compressPart(ctx context.Context, in, out string, startAt, dur float64, split, hasAudio bool, vk, ak, maxSide int) error {
+func (t Tools) compressPart(ctx context.Context, in, out string, startAt, dur, fps float64, split, hasAudio bool, vk, ak, maxSide int) error {
 	args := []string{"-hide_banner", "-nostdin", "-y"}
 	if split {
 		args = append(args, "-ss", fmt.Sprintf("%.3f", startAt), "-t", fmt.Sprintf("%.3f", dur))
@@ -394,6 +437,7 @@ func (t Tools) compressPart(ctx context.Context, in, out string, startAt, dur fl
 	args = append(args,
 		"-b:v", fmt.Sprintf("%dk", vk), "-maxrate", fmt.Sprintf("%dk", vk*5/4), "-bufsize", fmt.Sprintf("%dk", vk*2),
 		"-vf", fmt.Sprintf("scale='if(gte(iw,ih),min(%[1]d,iw),-2)':'if(gte(iw,ih),-2,min(%[1]d,ih))',scale=trunc(iw/2)*2:trunc(ih/2)*2", maxSide))
+	args = append(args, "-fps_mode", "cfr", "-r", strconv.Itoa(StandardFPS(fps)))
 	if hasAudio {
 		args = append(args, "-map", "0:a:0?", "-c:a", "aac", "-b:a", fmt.Sprintf("%dk", ak), "-ar", "44100")
 	} else {

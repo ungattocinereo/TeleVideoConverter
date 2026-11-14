@@ -195,12 +195,16 @@ func (w *Worker) finalize(ctx context.Context, res *fetch.Result, log *slog.Logg
 			}
 		} else {
 			// Tell the status message whether we only serve or really cook.
-			if p, perr := w.media.Probe(ctx, path); perr == nil && p.NeedsEncode() {
+			size := int64(0)
+			if st, serr := os.Stat(path); serr == nil {
+				size = st.Size()
+			}
+			if p, perr := w.media.Probe(ctx, path); perr == nil && p.WillEncode(size, w.cfg.TargetBytes) {
 				phase("encoding")
 			} else {
 				phase("remuxing")
 			}
-			if nr, nerr := w.media.Normalize(ctx, path, out); nerr == nil {
+			if nr, nerr := w.media.Normalize(ctx, path, out, w.cfg.TargetBytes); nerr == nil {
 				path = nr.Path
 				width, height, duration = nr.Probe.Width, nr.Probe.Height, nr.Probe.Duration
 				probedCodec = nr.Probe.VideoCodec
