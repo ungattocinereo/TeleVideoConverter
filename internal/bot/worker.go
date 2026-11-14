@@ -325,8 +325,9 @@ func (w *Worker) sendStats(ctx context.Context, chat int64, v *store.Video, dura
 	}
 	facts = append(facts, "💾 "+formatSize(v.FileSize))
 	text := head + "\n" + strings.Join(facts, " · ") + "\n🧊 хранится до " + ruDate(v.DeleteTimestamp)
-	if v.Title != "" && v.Title != v.VideoID {
-		text += "\n\n<i>" + html.EscapeString(runes(strings.TrimSpace(v.Title), 200)) + "</i>"
+	// A link back to the original post; the preview is disabled below.
+	if strings.HasPrefix(v.OriginalURL, "http://") || strings.HasPrefix(v.OriginalURL, "https://") {
+		text += "\n🔗 <a href=\"" + html.EscapeString(v.OriginalURL) + "\">Оригинал</a>"
 	}
 	_, err := w.tg.SendMessage(ctx, chat, text, tg.SendOpts{ParseMode: "HTML", DisableWebPagePreview: true})
 	return err
