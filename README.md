@@ -1,322 +1,158 @@
-# TeleVideoConverter Download
-
-A self-hosted Telegram bot for downloading videos with a web interface for managing files.
-
-## Features
-
-- **Telegram Bot Integration**
-  - Download videos from multiple platforms (YouTube, Instagram, TikTok, Vimeo, and more via yt-dlp)
-  - Automatic best quality selection with universal device compatibility
-  - Post description extraction and optional display (toggle with /description)
-  - Per-user settings stored in database
-  - Automatic file management with 3-day retention
-  - User authentication via whitelist
-  - Cookie-based authentication for private content (Instagram, TikTok, etc.)
-
-- **Web Interface**
-  - Modern dark-themed UI built with React and shadcn/ui
-  - Real-time updates via WebSocket
-  - Video grid with thumbnails
-  - Search functionality
-  - Detailed video information
-  - Direct download from browser
-
-- **Storage Management**
-  - Automatic cleanup of expired videos
-  - 5GB storage limit with automatic management
-  - SQLite database for metadata
-  - Efficient file organization
-
-- **Video Encoding & Compatibility**
-  - Force re-encoding with H.264 Baseline profile for universal compatibility
-  - Optimized for iOS, macOS, Android, and Desktop Telegram clients
-  - Proper keyframe intervals and streaming support
-  - Fixes Instagram/TikTok video playback issues on Apple devices
-  - Automatic codec conversion ensuring videos play correctly everywhere
-
-## Prerequisites
-
-- Docker and Docker Compose
-- Telegram Bot Token (from @BotFather)
-- Your Telegram User ID (from @userinfobot)
-
-## Quick Start
-
-1. **Clone the repository**
-```bash
-git clone <repository-url>
-cd TeleVideoConverter
-```
-
-2. **Configure environment variables**
-
-The `.env` file is already configured with your Telegram credentials. All environment variables are set and ready to use.
-
-3. **Start the services**
-```bash
-docker-compose up -d
-```
-
-4. **Access the web interface**
-
-Open your browser and navigate to:
-```
-http://localhost:3000
-```
-
-5. **Use the Telegram bot**
-
-Send a video URL to your bot and select the desired quality!
-
-## Architecture
-
-The system consists of 6 Docker services:
-
-### 1. **Redis**
-- Message queue for download tasks
-- Handles communication between bot and downloader
-
-### 2. **Telegram Bot**
-- Receives video URLs from users
-- Presents quality selection interface
-- Sends completion notifications with stats
-- Manages user interactions
-
-### 3. **Downloader**
-- Processes download queue from Redis
-- Uses yt-dlp for video extraction
-- Generates thumbnails
-- Saves metadata to database
-- Sends files back to Telegram
-
-### 4. **Web API**
-- FastAPI backend with WebSocket support
-- RESTful endpoints for video management
-- Real-time notifications
-- File serving
-
-### 5. **Web Frontend**
-- React + TypeScript + Vite
-- shadcn/ui components
-- Dark theme
-- Responsive design
-- Real-time updates
-
-### 6. **Cleanup Service**
-- Runs hourly cleanup cycle
-- Removes expired videos (>3 days old)
-- Manages storage limits
-- Maintains database integrity
-
-## Telegram Bot Commands
-
-- `/start` - Show welcome message and instructions
-- `/list` - List all saved videos with details
-- `/search <keyword>` - Search videos by title
-- `/stats` - Show usage statistics
-- `/description` - Toggle post description display (on/off)
-
-To download a video, simply send a URL to the bot! The bot will:
-1. Send technical details (file size, quality, processing time)
-2. Send the video file with thumbnail
-3. Send the post description (if enabled with `/description`)
-
-## Development
-
-### Running locally (without Docker)
-
-Each service can be run independently for development:
-
-**Telegram Bot:**
-```bash
-cd telegram-bot
-pip install -r requirements.txt
-python bot.py
-```
-
-**Downloader:**
-```bash
-cd downloader
-pip install -r requirements.txt
-python worker.py
-```
-
-**Web API:**
-```bash
-cd web-api
-pip install -r requirements.txt
-python api.py
-```
-
-**Web Frontend:**
-```bash
-cd web-frontend
-npm install
-npm run dev
-```
-
-**Cleanup:**
-```bash
-cd cleanup
-pip install -r requirements.txt
-python cleanup_cron.py
-```
-
-### Environment Variables
-
-All configuration is done via `.env`:
-
-- `TELEGRAM_BOT_TOKEN` - Your Telegram bot token
-- `TELEGRAM_USER_IDS` - Comma-separated list of allowed Telegram user IDs
-- `REDIS_HOST` - Redis hostname (default: redis)
-- `REDIS_PORT` - Redis port (default: 6379)
-- `STORAGE_PATH` - Path for video storage (default: /storage)
-- `MAX_STORAGE_GB` - Maximum storage in GB (default: 5)
-- `RETENTION_DAYS` - Days to keep videos (default: 3)
-- `SEND_POST_DESCRIPTION` - Send post descriptions by default (default: true)
-- `COOKIES_PATH` - Path for authentication cookies (default: /cookies)
-- `DATABASE_PATH` - SQLite database path (default: /db/televideo.db)
-- `API_PORT` - Web API port (default: 3001)
-- `LOG_LEVEL` - Logging level (default: INFO)
-- `TELEGRAM_SEND_LIMIT_MB` - Telegram cloud Bot API upload limit (default: 50)
-- `TELEGRAM_TARGET_MB` - Target size for compressed Telegram video parts (default: 48)
-- `TELEGRAM_MIN_VIDEO_BITRATE_K` - Minimum video bitrate before splitting into parts (default: 250)
-- `TELEGRAM_AUDIO_BITRATE_K` - Audio bitrate for compressed Telegram copies (default: 64)
-- `TELEGRAM_LARGE_FILE_POLICY` - Large video handling strategy (default: compress_then_split)
-- `WEB_PUBLIC_URL` - Fallback download URL shown if Telegram upload fails
-
-## Storage Structure
-
-```
-storage/
-├── videos/          # Downloaded video files
-└── thumbnails/      # Generated thumbnail images
-
-db/
-└── anithing.db     # SQLite database
-```
-
-## Database Schema
-
-### Videos Table
-Stores video metadata including:
-- Video ID, title, URL
-- Quality information
-- File paths and sizes
-- Download and delete timestamps
-- Processing statistics
-
-### Download Stats Table
-Tracks user actions:
-- Download events
-- Delete events
-- Timestamps for analytics
-
-### User Settings Table
-Stores per-user preferences:
-- Post description display preference
-- Other customizable settings
-- Created and updated timestamps
-
-## API Endpoints
-
-- `GET /api/videos` - List all videos
-- `GET /api/videos/:id` - Get video details
-- `GET /api/videos/:id/download` - Download video file
-- `DELETE /api/videos/:id` - Delete video
-- `GET /api/stats` - Get usage statistics
-- `GET /api/search?q=keyword` - Search videos
-- `GET /api/thumbnails/:filename` - Get thumbnail image
-- `WebSocket /ws` - Real-time updates
-
-## Video Encoding Technology
-
-This project uses advanced video encoding to ensure **bulletproof compatibility** across all devices:
-
-### Why Re-encoding?
-Instagram, TikTok, and other platforms often use H.264 High Profile codecs that don't work properly on iOS/macOS Telegram clients. Videos appear "frozen" with only audio playing.
-
-### Our Solution
-Every downloaded video is **automatically re-encoded** with:
-- **H.264 Baseline Profile** - Maximum compatibility across all devices
-- **Level 3.0** - Universal device support
-- **Proper keyframe intervals (GOP 50)** - Smooth playback and seeking
-- **AAC audio at 44.1kHz** - Standard compatibility
-- **faststart flag** - Enables streaming before full download
-- **Even dimensions** - Prevents encoding artifacts
-
-### Result
-✅ Videos from Instagram work perfectly on iPhone/iPad/Mac
-✅ No more "frozen first frame" issues
-✅ Proper playback controls and seeking
-✅ Universal compatibility across all Telegram clients
-
-The re-encoding process adds 5-10 seconds to download time but **guarantees** your videos will play correctly everywhere.
-
-### Large Telegram Uploads
-
-Telegram's cloud Bot API accepts uploaded video files up to 50MB. If a downloaded
-video is larger than the configured target size, the downloader now creates a
-temporary Telegram copy instead of changing the stored web copy:
-
-- compresses to H.264 Baseline + AAC with `faststart`
-- caps the longest side at 720p, lowering to 540p/480p/360p when bitrate is tight
-- calculates bitrate from the target size and video duration
-- splits very long videos into multiple Telegram-sized parts
-- falls back to the web interface link if compression or upload fails
-
-## Troubleshooting
-
-### Videos not downloading
-1. Check bot logs: `docker-compose logs telegram-bot`
-2. Check downloader logs: `docker-compose logs downloader`
-3. Ensure yt-dlp supports the platform
-
-### Web interface not loading
-1. Check web-api logs: `docker-compose logs web-api`
-2. Check web-frontend logs: `docker-compose logs web-frontend`
-3. Verify ports 3000 and 3001 are not in use
-
-### Storage full
-- Check storage usage in web interface
-- Manually run cleanup: `docker-compose restart cleanup-cron`
-- Adjust `MAX_STORAGE_GB` in `.env`
-
-## Logs
-
-View logs for any service:
-```bash
-docker-compose logs -f <service-name>
-```
-
-Available services:
-- `redis`
-- `telegram-bot`
-- `downloader`
-- `web-api`
-- `web-frontend`
-- `cleanup-cron`
-
-## Updating
+# TeleVideoConverter
+
+A self-hosted Telegram bot that downloads videos from YouTube, Instagram, TikTok,
+X/Twitter, Threads, Vimeo and everything else [yt-dlp](https://github.com/yt-dlp/yt-dlp)
+supports, sends them back as files that play on every Telegram client, and keeps
+them for a few days behind a small web page.
+
+Since November 2026 it is a single Go binary in one **rootless, shell-less image
+built `FROM scratch`**. The previous Python version (6 containers, Redis, React)
+is preserved under the git tag `python-final`.
+
+## Why the rewrite: benefits
+
+Measured on the same Mac (OrbStack) with the same links, Python version vs. Go version:
+
+| | Python (6 containers) | Go (1 container) |
+|---|---|---|
+| Images on disk | ~2.6 GB | ~213 MB (≈12× smaller) |
+| Memory when idle | ~180 MB | ~8 MB (≈20× less) |
+| Services to run | bot, downloader, web API, React/nginx, cleanup, Redis | one binary |
+| Short X clip (2.6 MB) | 4 s | 2.3 s |
+| X video (42.7 MB) | 13 s | 4.7 s |
+| Instagram reel (VP9) | 10 s | 7.7 s |
+| 10-min 1080p video → Telegram copy | minutes (full encode + 2-pass) | 33 s (single pass) |
+
+- **Safer image.** `FROM scratch`, no shell, no package manager, non-root UID,
+  read-only root filesystem, no Linux capabilities. Only the binary and the
+  tools it runs are inside.
+- **Fewer moving parts.** No Redis, no nginx, no Node build, no shared-SQLite
+  race between four processes. One process owns the database.
+- **Nothing gets lost.** Jobs live in a SQLite queue: a restart or crash
+  resumes interrupted downloads instead of dropping them.
+- **Faster delivery to Telegram.** Videos are encoded once to constant frame
+  rate H.264, which Telegram accepts instantly (remuxed X/Threads clips made
+  it think for 15 s to 2 min). A video requested again is re-sent by
+  `file_id` without uploading.
+- **Smarter large files.** Over 50 MB: one-pass compression on a 720p→360p
+  ladder, split into parts only when the video is too long.
+- **Resilient networking.** Separate connections for polling, calls and
+  uploads; retries with backoff on 429/5xx; dead connections are dropped
+  after network errors; the status animation backs off when Telegram is slow.
+- **Observable.** Per-video download/processing/sending times in the
+  database; slow Telegram calls are logged with upload vs. server time;
+  the bot token never appears in logs.
+- **Cleaner storage.** Leftover files no database row points at are removed
+  after the retention period (the old cleanup left them forever).
+- **More fun.** A much larger pelmeni-obsessed status vocabulary for every
+  stage of a download, with a dumpling progress bar — and a short,
+  joke-free card with a link to the original right before each video.
+
+## What it does
+
+- Send a link to the bot. It edits one status message with progress
+  (the "pelmeni" status), then sends the file stats, the video, and the post
+  description (toggle with `/description`).
+- Videos up to 48 MB are encoded once to constant-frame-rate H.264
+  (veryfast, CRF 23) so Telegram accepts them instantly; larger H.264 files
+  are only remuxed for storage and get a compressed copy for Telegram.
+- Files over Telegram's 50 MB bot limit get a compressed copy (single pass,
+  720p→360p ladder) and are split into parts when the video is long.
+- If an upload fails, the bot links to the web page instead.
+- Videos are deleted after `RETENTION_DAYS` (default 3) or when storage exceeds
+  `MAX_STORAGE_GB` (default 5). Unreferenced leftover files are cleaned too.
+- Site workarounds: Instagram carousels (first video), Threads (web API),
+  TikTok photo posts (rendered slideshow) and TikTok login walls (embed fallback).
+- Interrupted downloads (restart, crash) stay in a SQLite queue and resume.
+
+Bot commands: `/start`, `/list`, `/search <keyword>`, `/stats`, `/description`.
+
+## Image
+
+| part | size | notes |
+|---|---|---|
+| `tvc` | ~14 MB | Go, `CGO_ENABLED=0`, pure-Go SQLite |
+| `ffmpeg` + `ffprobe` | ~31 MB | built in the Dockerfile, fully static, only the codecs used |
+| `qjs` | ~2.5 MB | QuickJS-ng, static; solves YouTube's JS challenges for yt-dlp |
+| `yt-dlp` | ~94 MB | official musl onedir build (bundled CPython + curl_cffi), plus the musl loader and libz it needs |
+
+The final stage is `FROM scratch`: no shell, no package manager, runs as UID
+65532, works with a read-only root filesystem and no capabilities. The health
+check is `tvc healthcheck`.
+
+## Run
 
 ```bash
-git pull
-docker-compose down
-docker-compose build
-docker-compose up -d
+cp .env.example .env   # set TELEGRAM_BOT_TOKEN and TELEGRAM_USER_IDS
+docker compose up -d --build
 ```
 
-## Backup
+The web page is on `http://127.0.0.1:3000`. The compose file attaches the
+container to the external `common` network with the alias
+`televideoconverter-web-frontend-1`, which the reverse proxy uses.
 
-Backup database and videos:
+Useful commands (there is no shell inside the container):
+
 ```bash
-tar -czf backup-$(date +%Y%m%d).tar.gz storage/ db/
+docker exec televideoconverter tvc doctor
+docker exec televideoconverter tvc prepare /storage/videos/ID.mp4
+docker logs -f televideoconverter
 ```
+
+`doctor` prints the bundled tool versions; `prepare` dry-runs the Telegram
+compression/splitting for a file and leaves the result in `/tmp`.
+
+## Configuration
+
+| variable | default | |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | — | required |
+| `TELEGRAM_USER_IDS` | — | comma-separated allowed user IDs |
+| `STORAGE_PATH` / `DATABASE_PATH` / `COOKIES_PATH` | `/storage`, `/db/televideo.db`, `/cookies` | |
+| `RETENTION_DAYS` | `3` | |
+| `MAX_STORAGE_GB` | `5` | |
+| `SEND_POST_DESCRIPTION` | `true` | default for users who never used `/description` |
+| `TELEGRAM_SEND_LIMIT_MB` / `TELEGRAM_TARGET_MB` | `50` / `48` | |
+| `TELEGRAM_MIN_VIDEO_BITRATE_K` / `TELEGRAM_AUDIO_BITRATE_K` | `250` / `64` | below the minimum, long videos are split |
+| `TELEGRAM_LARGE_FILE_POLICY` | `compress_then_split` | anything else refuses to split |
+| `H264_PROFILE` | `high` | profile for re-encodes; `baseline` if an old device cannot play them |
+| `WEB_PUBLIC_URL` | `https://televideo.cnr.pw` | link sent when an upload fails |
+| `WEB_PASSWORD` | empty | if set, the web page and API require HTTP basic auth |
+| `MAX_DOWNLOADS_PER_HOUR` | `10` | per user |
+| `JOB_TIMEOUT_MINUTES` | `45` | |
+| `LOG_LEVEL` | `INFO` | |
+
+Cookies for private or login-walled content go in `cookies/` as Netscape files:
+`instagram.txt`, `tiktok.txt`, `twitter.txt`, `facebook.txt` (see `cookies/README.md`).
+
+## Web API
+
+The same paths the old React frontend used: `GET /api/videos`, `GET /api/videos/{id}`,
+`GET /api/videos/{id}/download` (supports Range), `DELETE /api/videos/{id}`,
+`GET /api/stats`, `GET /api/search?q=`, `GET /api/thumbnails/{id}.jpg`,
+`POST /api/submit-url` (`{"url": "...", "quality": "best"|"audio"}`), and `GET /healthz`.
+
+## Layout
+
+```
+cmd/tvc/            entry point: serve, healthcheck, doctor, prepare
+internal/config     environment variables
+internal/store      SQLite (Python-era schema + jobs queue + stage timings)
+internal/tg         minimal Telegram Bot API client (streaming uploads, retries, no token in errors)
+internal/fetch      yt-dlp runner and site workarounds
+internal/media      ffprobe/ffmpeg: remux vs encode, thumbnails, Telegram size limits
+internal/bot        commands, queue worker, animated status messages
+internal/web        HTML page + JSON API
+internal/cleanup    retention, storage cap, orphan files
+```
+
+Tests: `docker run --rm -v "$PWD":/src -w /src golang:1.27-alpine go test ./...`
+
+## Updating yt-dlp
+
+Sites change and yt-dlp follows. Bump `YTDLP_VERSION` in the `Dockerfile` and
+rebuild; the build verifies the release checksum.
 
 ## License
 
-MIT
-
-## Copyright
-
-Gregory 'Cinereo' Smirnov
+MIT · Gregory 'Cinereo' Smirnov

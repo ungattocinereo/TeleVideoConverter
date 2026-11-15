@@ -1,84 +1,32 @@
 services:
-  redis:
-    image: redis:7-alpine
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-    networks:
-      - common
-
-  telegram-bot:
-    build: ./telegram-bot
-    env_file: .env
-    depends_on:
-      redis:
-        condition: service_healthy
-    volumes:
-      - ./storage:/storage
-      - ./db:/db
-    restart: unless-stopped
-    networks:
-      - common
-
-  downloader:
-    build: ./downloader
+  tvc:
+    build: .
+    image: televideoconverter:latest
+    container_name: televideoconverter
     env_file: .env
     environment:
-      TELEGRAM_SEND_LIMIT_MB: ${TELEGRAM_SEND_LIMIT_MB:-50}
-      TELEGRAM_TARGET_MB: ${TELEGRAM_TARGET_MB:-48}
-      TELEGRAM_MIN_VIDEO_BITRATE_K: ${TELEGRAM_MIN_VIDEO_BITRATE_K:-250}
-      TELEGRAM_AUDIO_BITRATE_K: ${TELEGRAM_AUDIO_BITRATE_K:-64}
-      TELEGRAM_LARGE_FILE_POLICY: ${TELEGRAM_LARGE_FILE_POLICY:-compress_then_split}
-    depends_on:
-      redis:
-        condition: service_healthy
+      LISTEN_ADDR: ":3000"
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,uid=65532,gid=65532,mode=0700
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    pids_limit: 256
+    mem_limit: 1536m
+    stop_grace_period: 30s
     volumes:
       - ./storage:/storage
       - ./db:/db
       - ./cookies:/cookies
-    restart: unless-stopped
-    networks:
-      - common
-
-  web-api:
-    build: ./web-api
-    env_file: .env
     ports:
-      - "3001:3001"
-    volumes:
-      - ./storage:/storage
-      - ./db:/db
-    restart: unless-stopped
+      - "127.0.0.1:3000:3000"
     networks:
-      - common
-
-  web-frontend:
-    build: ./web-frontend
-    ports:
-      - "3000:3000"
-    depends_on:
-      - web-api
+      common:
+        # Nginx Proxy Manager forwards televideo.cnr.pw to this name.
+        aliases: [televideoconverter-web-frontend-1]
     restart: unless-stopped
-    networks:
-      - common
-
-  cleanup-cron:
-    build: ./cleanup
-    env_file: .env
-    volumes:
-      - ./storage:/storage
-      - ./db:/db
-    restart: unless-stopped
-    networks:
-      - common
-
-volumes:
-  redis_data:
 
 networks:
   common:
