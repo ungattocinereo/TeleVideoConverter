@@ -41,9 +41,12 @@ Go is not installed on the host; use the golang container.
    (`--progress-template`, `-O after_move:` JSON) or a site workaround
    (Instagram carousel via `-J` + `--load-info-json`, Threads web API,
    TikTok slideshow / embed fallback).
-3. `media.Normalize`: H.264 8-bit 4:2:0 with even dimensions is **remuxed**
-   (`-c copy +faststart`), anything else is re-encoded once (libx264
-   `H264_PROFILE`, veryfast, CRF 23). Thumbnails are 320px JPEGs.
+3. `media.Normalize`: files up to the Telegram target (48 MB) are always
+   re-encoded once to constant frame rate (libx264 `H264_PROFILE`, veryfast,
+   CRF 23, nearest of 24/25/30/50/60 fps) — Telegram re-processes remuxed
+   social-media files with irregular timestamps for 15 s–2 min. Larger
+   compatible H.264 is only remuxed (`-c copy +faststart`); its Telegram copy
+   is compressed CFR anyway. Thumbnails are 320px JPEGs.
 4. The row is saved to `videos` (with `download_seconds`/`process_seconds`/
    `send_seconds`), then stats, video (compressed/split by
    `media.PrepareForTelegram` above 48 MB) and description are sent.
